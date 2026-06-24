@@ -1,0 +1,75 @@
+# ═══════════════════════════════════════════════════════════════
+#  CIVITAS — Production Environment Configuration
+#  Overrides config/default.yaml
+#  Secrets MUST be provided via environment variables, not this file.
+# ═══════════════════════════════════════════════════════════════
+
+app:
+  env: production
+  log_level: INFO
+  log_format: json          # Structured logs for aggregation (Datadog, Splunk)
+
+postgres:
+  pool_size: 20
+  max_overflow: 40
+  pool_timeout: 30
+
+vector:
+  dimension: 1536
+  index_type: hnsw           # HNSW for best production query performance
+  hnsw_m: 16
+  hnsw_ef_construction: 64
+
+embedding:
+  model: text-embedding-3-small
+  batch_size: 100
+  retry_attempts: 5
+
+llm:
+  model: gpt-4o-mini
+  temperature: 0.0
+  max_tokens: 2048
+
+ingestion:
+  chunk_size: 512
+  chunk_overlap: 64
+  batch_size: 50
+  max_workers: 8
+
+quality:
+  min_score: 0.6            # Higher bar in production
+  auto_reject_below: 0.3
+  auto_approve_above: 0.9
+  check_on_ingestion: true
+  min_word_count: 100
+
+governance:
+  audit_enabled: true       # Always audit in production
+  require_approval: true    # Require human approval before ACTIVE
+  retention_default_days: 365
+  default_classification: confidential   # Conservative default
+
+retrieval:
+  reranking_enabled: true
+  min_similarity_score: 0.3  # Filter low-quality results
+
+graphrag:
+  enabled: true
+  entity_extraction_model: gpt-4o-mini
+  max_cluster_size: 10
+  community_reports: true
+
+# Production: all spaces active with higher quality gates
+knowledge_spaces:
+  global-shared:
+    min_quality_score: 0.6
+  legal-contracts:
+    min_quality_score: 0.75
+    require_approval: true
+  finance-reports:
+    min_quality_score: 0.70
+    require_approval: true
+  hr-policies:
+    min_quality_score: 0.65
+  technical-docs:
+    min_quality_score: 0.60

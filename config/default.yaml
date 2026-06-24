@@ -1,0 +1,143 @@
+# ═══════════════════════════════════════════════════════════════
+#  CIVITAS — Default Configuration
+#  Overridden by environment-specific config files.
+#  All values here can also be set via environment variables.
+# ═══════════════════════════════════════════════════════════════
+
+app:
+  name: CIVITAS Knowledge Platform
+  version: "0.1.0"
+  env: development
+  log_level: INFO
+  log_format: text           # text | json
+
+# ── PostgreSQL ────────────────────────────────────────────────
+postgres:
+  host: localhost
+  port: 5432
+  db: civitas_knowledge
+  user: civitas
+  pool_size: 10
+  max_overflow: 20
+  pool_timeout: 30
+
+# ── pgvector ──────────────────────────────────────────────────
+vector:
+  dimension: 1536             # Must match embedding model output
+  similarity_metric: cosine   # cosine | l2 | inner_product
+  index_type: hnsw            # hnsw | ivfflat
+  hnsw_m: 16
+  hnsw_ef_construction: 64
+  ivfflat_lists: 100
+
+# ── Embeddings ────────────────────────────────────────────────
+embedding:
+  provider: openai
+  model: text-embedding-3-small
+  batch_size: 100
+  timeout_seconds: 60
+  retry_attempts: 3
+
+# ── LLM ───────────────────────────────────────────────────────
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  temperature: 0.0
+  max_tokens: 2048
+
+# ── Ingestion ─────────────────────────────────────────────────
+ingestion:
+  chunk_size: 512
+  chunk_overlap: 64
+  batch_size: 50
+  max_workers: 4
+  default_chunk_strategy: sentence   # sentence | semantic | hierarchical
+  allowed_extensions:
+    - .pdf
+    - .docx
+    - .doc
+    - .txt
+    - .md
+    - .html
+    - .htm
+    - .csv
+    - .json
+    - .xml
+    - .xlsx
+  max_file_size_mb: 100
+
+# ── Indexing ──────────────────────────────────────────────────
+indexing:
+  default_top_k: 10
+  rebuild_on_startup: false
+  enable_keyword_index: true
+  enable_summary_index: true
+  enable_graph_index: false   # Enabled per-space in knowledge_spaces config
+
+# ── Retrieval ─────────────────────────────────────────────────
+retrieval:
+  default_strategy: hybrid    # semantic | keyword | hybrid | graph_enhanced | full
+  reranking_enabled: true
+  reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  rrf_k: 60                   # Reciprocal Rank Fusion constant
+  min_similarity_score: 0.0   # Filter results below this threshold
+
+# ── GraphRAG ──────────────────────────────────────────────────
+graphrag:
+  enabled: true
+  entity_extraction_model: gpt-4o-mini
+  max_cluster_size: 10
+  community_reports: true
+  min_edge_weight: 0.5
+  max_triplets_per_chunk: 10
+  max_hops: 2
+
+# ── Quality ───────────────────────────────────────────────────
+quality:
+  min_score: 0.5
+  auto_reject_below: 0.2
+  auto_approve_above: 0.9
+  check_on_ingestion: true
+  min_word_count: 50
+  max_word_count: 500000
+
+# ── Governance ────────────────────────────────────────────────
+governance:
+  audit_enabled: true
+  retention_default_days: 365
+  require_approval: false     # Set true in production
+  default_classification: internal
+  default_access_level: team
+
+# ── Knowledge Spaces (default configuration) ──────────────────
+knowledge_spaces:
+  global-shared:
+    enabled: true
+    index_strategy: hybrid
+    graphrag: false
+
+  legal-contracts:
+    enabled: true
+    index_strategy: graph_enhanced
+    graphrag: true
+    min_quality_score: 0.7
+
+  finance-reports:
+    enabled: true
+    index_strategy: hybrid
+    graphrag: false
+
+  hr-policies:
+    enabled: true
+    index_strategy: hybrid
+    graphrag: false
+
+  technical-docs:
+    enabled: true
+    index_strategy: full
+    graphrag: false
+
+  external-knowledge:
+    enabled: true
+    index_strategy: semantic
+    graphrag: false

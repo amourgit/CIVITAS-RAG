@@ -1,0 +1,45 @@
+# ═══════════════════════════════════════════════════════════════
+#  CIVITAS — Development Environment Configuration
+#  Overrides config/default.yaml
+# ═══════════════════════════════════════════════════════════════
+
+app:
+  env: development
+  log_level: DEBUG
+  log_format: text
+
+postgres:
+  host: localhost
+  port: 5432
+  db: civitas_dev
+  pool_size: 5
+
+vector:
+  dimension: 1536
+  index_type: ivfflat      # Faster to build in dev (fewer vectors)
+  ivfflat_lists: 10        # Low for small dev datasets
+
+embedding:
+  model: text-embedding-3-small
+  batch_size: 20           # Small batches in dev
+
+llm:
+  model: gpt-4o-mini       # Cheapest model in dev
+  temperature: 0.0
+
+ingestion:
+  chunk_size: 256           # Smaller chunks for faster dev iteration
+  chunk_overlap: 32
+  batch_size: 10
+
+quality:
+  min_score: 0.3            # Lower bar in dev
+  auto_reject_below: 0.1
+  check_on_ingestion: false # Speed up dev ingestion
+
+governance:
+  audit_enabled: false      # Reduce noise in dev
+  require_approval: false
+
+graphrag:
+  enabled: false            # Disable by default in dev (expensive)
