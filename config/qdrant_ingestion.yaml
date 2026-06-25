@@ -1,0 +1,181 @@
+# ═══════════════════════════════════════════════════════════════
+#  CIVITAS — Configuration Qdrant Ingestion
+#  Fichier: config/qdrant_ingestion.yaml
+#
+#  Usage:
+#    python scripts/qdrant_ingest.py --config config/qdrant_ingestion.yaml --scan ansible_scan
+#    python scripts/qdrant_ingest.py --config config/qdrant_ingestion.yaml --all
+# ═══════════════════════════════════════════════════════════════
+
+# ── Connexion Qdrant ──────────────────────────────────────────
+# Option 1: Local / Docker (défaut)
+qdrant:
+  host: localhost
+  port: 6333
+  # api_key:  # Optionnel pour local
+
+# Option 2: Qdrant Cloud (décommenter)
+# qdrant:
+#   url: https://xxxx.cloud.qdrant.io
+#   api_key: your-qdrant-cloud-api-key
+
+# ── Modèle d'Embedding ────────────────────────────────────────
+embedding:
+  provider: sentence-transformers     # sentence-transformers | openai
+  model_name: all-MiniLM-L6-v2       # Rapide, léger (384 dims)
+  vector_size: 384
+  batch_size: 64
+  device: cpu                         # cpu | cuda | mps
+  normalize_embeddings: true
+
+  # Alternatives (commenter/décommenter selon le besoin):
+  # Multilingue (FR+EN+AR+ES...):
+  # model_name: paraphrase-multilingual-mpnet-base-v2
+  # vector_size: 768
+
+  # Haute qualité (plus lent):
+  # model_name: all-mpnet-base-v2
+  # vector_size: 768
+
+  # OpenAI (nécessite OPENAI_API_KEY):
+  # provider: openai
+  # openai_model: text-embedding-3-small
+  # vector_size: 1536
+
+# ── Collections Qdrant ────────────────────────────────────────
+# Chaque collection = un domaine de connaissance.
+# Libre d'en ajouter autant que nécessaire.
+collections:
+  ansible_docs:
+    description: "Playbooks, roles et configurations Ansible"
+    distance: Cosine
+    chunk_size: 400
+    chunk_overlap: 50
+    default_domain: devops
+    default_tags: [ansible, iac, automation]
+
+  terraform_docs:
+    description: "Modules et configurations Terraform/OpenTofu"
+    distance: Cosine
+    chunk_size: 400
+    chunk_overlap: 50
+    default_domain: devops
+    default_tags: [terraform, iac, cloud]
+
+  ssh_config_docs:
+    description: "Configurations SSH par environnement"
+    distance: Cosine
+    chunk_size: 300
+    chunk_overlap: 40
+    default_domain: infrastructure
+    default_tags: [ssh, security, config]
+
+  iam_policies_docs:
+    description: "Politiques IAM AWS et GCP"
+    distance: Cosine
+    chunk_size: 350
+    chunk_overlap: 50
+    default_domain: security
+    default_tags: [iam, aws, gcp, policies, security]
+
+  cicd_docs:
+    description: "Pipelines CI/CD Jenkins, GitHub Actions, Docker"
+    distance: Cosine
+    chunk_size: 450
+    chunk_overlap: 60
+    default_domain: devops
+    default_tags: [cicd, jenkins, github-actions, docker]
+
+# ── Paramètres d'Ingestion Globaux ───────────────────────────
+ingestion:
+  # Extensions autorisées (s'applique si la collection ne définit pas les siennes)
+  allowed_extensions:
+    # Documents
+    - .pdf
+    - .docx
+    - .doc
+    - .txt
+    - .md
+    # Code & IaC
+    - .yml
+    - .yaml
+    - .tf
+    - .tfvars
+    - .sh
+    - .conf
+    - .config
+    - .json
+    - .xml
+    - .toml
+    - .ini
+    - .env
+    - .properties
+    # Fichiers sans extension reconnus (via leur nom)
+    - Dockerfile
+    - Jenkinsfile
+    - Makefile
+
+  # Chunking par défaut
+  chunk_size: 512
+  chunk_overlap: 64
+
+  # Base SQLite de tracking (déduplication)
+  tracker_db_path: .civitas_ingestion_tracker.db
+
+  # Concurrence
+  max_workers: 4
+  batch_size: 50   # Points Qdrant par batch d'upsert
+
+# ── Scans Prédéfinis ─────────────────────────────────────────
+# Chaque scan = une cible + une collection + des options.
+# Lance avec: --scan <nom_du_scan>
+# Lance tous: --all
+scans:
+  ansible_scan:
+    source_path: data/documents/ansible
+    collection_name: ansible_docs
+    recursive: true
+    skip_existing: true    # Déduplication activée
+    domain: devops
+    tags: [ansible]
+
+  terraform_scan:
+    source_path: data/documents/terraform
+    collection_name: terraform_docs
+    recursive: true
+    skip_existing: true
+    domain: devops
+    tags: [terraform]
+
+  ssh_scan:
+    source_path: data/documents/ssh
+    collection_name: ssh_config_docs
+    recursive: true
+    skip_existing: true
+    domain: infrastructure
+    tags: [ssh]
+
+  iam_scan:
+    source_path: data/documents/iam
+    collection_name: iam_policies_docs
+    recursive: true
+    skip_existing: true
+    domain: security
+    tags: [iam]
+
+  cicd_scan:
+    source_path: data/documents/cicd
+    collection_name: cicd_docs
+    recursive: true
+    skip_existing: true
+    domain: devops
+    tags: [cicd]
+
+  # Scan global sur tout /data/documents
+  full_scan:
+    source_path: data/documents
+    collection_name: all_docs
+    recursive: true
+    skip_existing: true
+    domain: ""
+    tags: []

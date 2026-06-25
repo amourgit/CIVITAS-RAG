@@ -1,0 +1,56 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_REGISTRY  = 'registry.civitas.io'
+        IMAGE_NAME       = 'civitas-api'
+        DEPLOY_ENV       = "${env.BRANCH_NAME == 'main' ? 'production' : 'staging'}"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build & Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh 'pytest tests/unit -v --cov=civitas'
+                    }
+                }
+                stage('Lint') {
+                    steps {
+                        sh 'ruff check civitas/ && mypy civitas/'
+                    }
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def tag = "${env.BUILD_NUMBER}-${env.GIT_COMMIT[0..7]}"
+                    sh "docker build -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${tag} ."
+                    sh "docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${tag}"
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when { branch 'main' }
+            steps {
+                sh "kubectl set image deployment/civitas-api app=${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.BUILD_TAG}"
+                sh "kubectl rollout status deployment/civitas-api --timeout=300s"
+            }
+        }
+    }
+
+    post {
+        failure {
+            slackSend(channel: '#ci-alerts', message: "Pipeline failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}")
+        }
+    }
+}

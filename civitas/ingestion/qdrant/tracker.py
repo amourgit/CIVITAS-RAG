@@ -1,0 +1,443 @@
+"""
+civitas.ingestion.qdrant.tracker
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Système de tracking pour l'ingestion incrémentale.
+
+Stocke l'état de chaque fichier ingéré dans une base SQLite locale,
+permettant:
+  · La déduplication stricte (un fichier n'est jamais réindexé si inchangé)
+  · La détection des fichiers modifiés (via hash SHA-256 + mtime)
+  · L'historique complet des ingestions
+  · Le nettoyage sélectif (reset par collection ou global)
+
+Structure de la DB:
+  Table ingested_files:
+    - file_path      : chemin absolu du fichier
+    - collection     : nom de la collection Qdrant
+    - file_hash      : SHA-256 du contenu
+    - mtime          : modification time (float)
+    - file_size      : taille en octets
+    - ingested_at    : timestamp d'ingestion
+    - point_ids      : IDs des points Qdrant créés (JSON list)
+    - chunks_count   : nombre de chunks créés
+    - status         : success | failed | skipped
+    - error_msg      : message d'erreur si échec
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Generator, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────
+#  RECORD
+# ─────────────────────────────────────────────────────────────
+
+class IngestionRecord:
+    """Représente l'état d'ingestion d'un fichier."""
+
+    __slots__ = (
+        "file_path", "collection", "file_hash", "mtime",
+        "file_size", "ingested_at", "point_ids", "chunks_count",
+        "status", "error_msg",
+    )
+
+    def __init__(
+        self,
+        file_path: str,
+        collection: str,
+        file_hash: str,
+        mtime: float,
+        file_size: int,
+        ingested_at: str,
+        point_ids: list[str],
+        chunks_count: int,
+        status: str,
+        error_msg: Optional[str] = None,
+    ) -> None:
+        self.file_path = file_path
+        self.collection = collection
+        self.file_hash = file_hash
+        self.mtime = mtime
+        self.file_size = file_size
+        self.ingested_at = ingested_at
+        self.point_ids = point_ids
+        self.chunks_count = chunks_count
+        self.status = status
+        self.error_msg = error_msg
+
+    @property
+    def is_success(self) -> bool:
+        return self.status == "success"
+
+
+# ─────────────────────────────────────────────────────────────
+#  TRACKER
+# ─────────────────────────────────────────────────────────────
+
+class IngestionTracker:
+    """
+    Tracker SQLite pour l'ingestion incrémentale.
+
+    Thread-safe via des connexions par opération.
+    La base est créée automatiquement si elle n'existe pas.
+
+    Usage:
+        tracker = IngestionTracker(".civitas_tracker.db")
+        if tracker.should_ingest(file_path, collection):
+            # Ingérer...
+            tracker.mark_success(file_path, collection, point_ids, chunks)
+        else:
+            # Fichier déjà ingéré et non modifié — skip
+    """
+
+    CREATE_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS ingested_files (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_path    TEXT    NOT NULL,
+        collection   TEXT    NOT NULL,
+        file_hash    TEXT    NOT NULL,
+        mtime        REAL    NOT NULL,
+        file_size    INTEGER NOT NULL,
+        ingested_at  TEXT    NOT NULL,
+        point_ids    TEXT    NOT NULL DEFAULT '[]',
+        chunks_count INTEGER NOT NULL DEFAULT 0,
+        status       TEXT    NOT NULL DEFAULT 'success',
+        error_msg    TEXT,
+        UNIQUE (file_path, collection)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_collection ON ingested_files(collection);
+    CREATE INDEX IF NOT EXISTS idx_file_path  ON ingested_files(file_path);
+    CREATE INDEX IF NOT EXISTS idx_status     ON ingested_files(status);
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = str(db_path)
+        self._ensure_schema()
+        logger.debug("IngestionTracker initialized: %s", self.db_path)
+
+    @contextmanager
+    def _conn(self) -> Generator[sqlite3.Connection, None, None]:
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _ensure_schema(self) -> None:
+        """Créer les tables si elles n'existent pas."""
+        with self._conn() as conn:
+            conn.executescript(self.CREATE_TABLE_SQL)
+
+    # ── Déduplication ─────────────────────────────────────────
+
+    @staticmethod
+    def compute_file_hash(file_path: str | Path) -> str:
+        """Calcule le SHA-256 d'un fichier (512KB chunks pour les gros fichiers)."""
+        h = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(524288), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def get_record(
+        self, file_path: str, collection: str
+    ) -> Optional[IngestionRecord]:
+        """Retourne l'enregistrement d'ingestion d'un fichier, si existant."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM ingested_files WHERE file_path=? AND collection=?",
+                (str(file_path), collection),
+            ).fetchone()
+            if row is None:
+                return None
+            return IngestionRecord(
+                file_path=row["file_path"],
+                collection=row["collection"],
+                file_hash=row["file_hash"],
+                mtime=row["mtime"],
+                file_size=row["file_size"],
+                ingested_at=row["ingested_at"],
+                point_ids=json.loads(row["point_ids"]),
+                chunks_count=row["chunks_count"],
+                status=row["status"],
+                error_msg=row["error_msg"],
+            )
+
+    def should_ingest(
+        self,
+        file_path: str | Path,
+        collection: str,
+        skip_existing: bool = True,
+    ) -> tuple[bool, str]:
+        """
+        Détermine si un fichier doit être ingéré.
+
+        Returns:
+            (should_process, reason) où reason est une des valeurs:
+              - "new"       : fichier jamais vu
+              - "modified"  : fichier modifié depuis la dernière ingestion
+              - "failed"    : précédente tentative échouée → réessayer
+              - "unchanged" : déjà ingéré avec succès et non modifié → skip
+        """
+        if not skip_existing:
+            return True, "force_reingest"
+
+        file_path = Path(file_path)
+        if not file_path.exists():
+            return False, "not_found"
+
+        record = self.get_record(str(file_path), collection)
+        if record is None:
+            return True, "new"
+
+        if record.status == "failed":
+            return True, "failed"
+
+        # Vérifier si le fichier a été modifié
+        try:
+            stat = file_path.stat()
+            current_mtime = stat.st_mtime
+            current_size = stat.st_size
+
+            # Comparaison rapide via mtime + taille
+            if current_mtime != record.mtime or current_size != record.file_size:
+                # Vérification précise via hash
+                current_hash = self.compute_file_hash(file_path)
+                if current_hash != record.file_hash:
+                    return True, "modified"
+
+        except OSError as e:
+            logger.warning("Cannot stat file %s: %s", file_path, e)
+            return True, "stat_error"
+
+        return False, "unchanged"
+
+    # ── Écriture ──────────────────────────────────────────────
+
+    def mark_success(
+        self,
+        file_path: str | Path,
+        collection: str,
+        point_ids: list[str],
+        chunks_count: int,
+        file_hash: Optional[str] = None,
+    ) -> None:
+        """Enregistrer un fichier comme ingéré avec succès."""
+        file_path = Path(file_path)
+        stat = file_path.stat()
+        h = file_hash or self.compute_file_hash(file_path)
+
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO ingested_files
+                    (file_path, collection, file_hash, mtime, file_size,
+                     ingested_at, point_ids, chunks_count, status, error_msg)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'success', NULL)
+                ON CONFLICT(file_path, collection) DO UPDATE SET
+                    file_hash    = excluded.file_hash,
+                    mtime        = excluded.mtime,
+                    file_size    = excluded.file_size,
+                    ingested_at  = excluded.ingested_at,
+                    point_ids    = excluded.point_ids,
+                    chunks_count = excluded.chunks_count,
+                    status       = 'success',
+                    error_msg    = NULL
+                """,
+                (
+                    str(file_path),
+                    collection,
+                    h,
+                    stat.st_mtime,
+                    stat.st_size,
+                    datetime.utcnow().isoformat(),
+                    json.dumps(point_ids),
+                    chunks_count,
+                ),
+            )
+
+    def mark_failed(
+        self,
+        file_path: str | Path,
+        collection: str,
+        error_msg: str,
+    ) -> None:
+        """Enregistrer un fichier comme échoué."""
+        file_path = Path(file_path)
+        try:
+            stat = file_path.stat()
+            mtime = stat.st_mtime
+            size = stat.st_size
+        except OSError:
+            mtime = 0.0
+            size = 0
+
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO ingested_files
+                    (file_path, collection, file_hash, mtime, file_size,
+                     ingested_at, point_ids, chunks_count, status, error_msg)
+                VALUES (?, ?, '', ?, ?, ?, '[]', 0, 'failed', ?)
+                ON CONFLICT(file_path, collection) DO UPDATE SET
+                    mtime        = excluded.mtime,
+                    file_size    = excluded.file_size,
+                    ingested_at  = excluded.ingested_at,
+                    status       = 'failed',
+                    error_msg    = excluded.error_msg
+                """,
+                (
+                    str(file_path),
+                    collection,
+                    mtime,
+                    size,
+                    datetime.utcnow().isoformat(),
+                    error_msg[:2000],
+                ),
+            )
+
+    def mark_skipped(self, file_path: str, collection: str) -> None:
+        """Logger un skip (pour les stats uniquement)."""
+        logger.debug("SKIP [%s] %s (unchanged)", collection, file_path)
+
+    # ── Lecture / Stats ───────────────────────────────────────
+
+    def list_collection(self, collection: str) -> list[IngestionRecord]:
+        """Liste tous les fichiers ingérés dans une collection."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ingested_files WHERE collection=? ORDER BY ingested_at DESC",
+                (collection,),
+            ).fetchall()
+            return [
+                IngestionRecord(
+                    file_path=r["file_path"],
+                    collection=r["collection"],
+                    file_hash=r["file_hash"],
+                    mtime=r["mtime"],
+                    file_size=r["file_size"],
+                    ingested_at=r["ingested_at"],
+                    point_ids=json.loads(r["point_ids"]),
+                    chunks_count=r["chunks_count"],
+                    status=r["status"],
+                    error_msg=r["error_msg"],
+                )
+                for r in rows
+            ]
+
+    def stats(self, collection: Optional[str] = None) -> dict:
+        """Retourne des statistiques sur l'ingestion."""
+        with self._conn() as conn:
+            where = "WHERE collection=?" if collection else ""
+            params = (collection,) if collection else ()
+
+            row = conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as succeeded,
+                    SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) as failed,
+                    SUM(chunks_count) as total_chunks,
+                    SUM(file_size) as total_bytes,
+                    MIN(ingested_at) as first_ingestion,
+                    MAX(ingested_at) as last_ingestion
+                FROM ingested_files {where}
+                """,
+                params,
+            ).fetchone()
+
+            collections_count = conn.execute(
+                "SELECT COUNT(DISTINCT collection) FROM ingested_files"
+            ).fetchone()[0]
+
+            return {
+                "total_files": row["total"] or 0,
+                "succeeded": row["succeeded"] or 0,
+                "failed": row["failed"] or 0,
+                "total_chunks": row["total_chunks"] or 0,
+                "total_bytes": row["total_bytes"] or 0,
+                "collections_count": collections_count,
+                "first_ingestion": row["first_ingestion"],
+                "last_ingestion": row["last_ingestion"],
+            }
+
+    def list_collections(self) -> list[dict]:
+        """Liste toutes les collections connues avec leurs stats."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    collection,
+                    COUNT(*) as files,
+                    SUM(chunks_count) as chunks,
+                    SUM(file_size) as bytes,
+                    MAX(ingested_at) as last_ingestion
+                FROM ingested_files
+                WHERE status='success'
+                GROUP BY collection
+                ORDER BY collection
+                """
+            ).fetchall()
+            return [
+                {
+                    "collection": r["collection"],
+                    "files": r["files"],
+                    "chunks": r["chunks"],
+                    "bytes": r["bytes"],
+                    "last_ingestion": r["last_ingestion"],
+                }
+                for r in rows
+            ]
+
+    # ── Nettoyage ─────────────────────────────────────────────
+
+    def reset_collection(self, collection: str) -> int:
+        """Supprimer tous les enregistrements d'une collection (pour réingérer)."""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM ingested_files WHERE collection=?", (collection,)
+            )
+            deleted = cursor.rowcount
+        logger.info("Tracker reset for collection '%s': %d records deleted", collection, deleted)
+        return deleted
+
+    def reset_all(self) -> int:
+        """Supprimer TOUS les enregistrements (réingestion totale)."""
+        with self._conn() as conn:
+            cursor = conn.execute("DELETE FROM ingested_files")
+            deleted = cursor.rowcount
+        logger.info("Tracker fully reset: %d records deleted", deleted)
+        return deleted
+
+    def remove_file(self, file_path: str, collection: str) -> bool:
+        """Supprimer l'enregistrement d'un fichier spécifique."""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM ingested_files WHERE file_path=? AND collection=?",
+                (file_path, collection),
+            )
+            return cursor.rowcount > 0
+
+    def get_point_ids(self, file_path: str, collection: str) -> list[str]:
+        """Récupérer les IDs Qdrant d'un fichier (pour suppression)."""
+        record = self.get_record(file_path, collection)
+        return record.point_ids if record else []

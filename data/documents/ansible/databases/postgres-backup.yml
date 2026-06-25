@@ -1,0 +1,34 @@
+---
+- name: PostgreSQL backup automation
+  hosts: databases
+  become: true
+  vars:
+    backup_dir: /var/backups/postgres
+    retention_days: 30
+  tasks:
+    - name: Create backup directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: postgres
+        mode: '0750'
+
+    - name: Run pg_dump backup
+      become_user: postgres
+      shell: |
+        pg_dump -Fc civitas_db > {{ backup_dir }}/civitas_$(date +%Y%m%d_%H%M%S).dump
+      args:
+        executable: /bin/bash
+
+    - name: Clean old backups
+      find:
+        paths: "{{ backup_dir }}"
+        age: "{{ retention_days }}d"
+        patterns: "*.dump"
+      register: old_backups
+
+    - name: Remove old backups
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_backups.files }}"

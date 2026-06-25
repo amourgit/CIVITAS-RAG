@@ -1,0 +1,25 @@
+---
+- name: Install and configure nginx web server
+  hosts: webservers
+  become: true
+  vars:
+    nginx_port: 80
+    nginx_ssl_port: 443
+  tasks:
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Enable nginx service
+      systemd:
+        name: nginx
+        enabled: yes
+        state: started
+
+    - name: Configure firewall for HTTP
+      ufw:
+        rule: allow
+        port: "{{ nginx_port }}"
+        proto: tcp

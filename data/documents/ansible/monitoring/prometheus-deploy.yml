@@ -1,0 +1,41 @@
+---
+- name: Deploy Prometheus monitoring stack
+  hosts: monitoring
+  become: true
+  vars:
+    prometheus_version: "2.52.0"
+    grafana_version: "10.4.0"
+    prometheus_port: 9090
+    grafana_port: 3000
+  tasks:
+    - name: Create prometheus user
+      user:
+        name: prometheus
+        system: yes
+        shell: /bin/false
+
+    - name: Download Prometheus
+      get_url:
+        url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+        dest: /tmp/prometheus.tar.gz
+
+    - name: Install Prometheus
+      unarchive:
+        src: /tmp/prometheus.tar.gz
+        dest: /opt/
+        remote_src: yes
+
+    - name: Configure Prometheus scrape targets
+      template:
+        src: prometheus.yml.j2
+        dest: /etc/prometheus/prometheus.yml
+      notify: restart prometheus
+
+    - name: Deploy Grafana via Docker
+      docker_container:
+        name: grafana
+        image: "grafana/grafana:{{ grafana_version }}"
+        ports:
+          - "{{ grafana_port }}:3000"
+        state: started
+        restart_policy: unless-stopped
