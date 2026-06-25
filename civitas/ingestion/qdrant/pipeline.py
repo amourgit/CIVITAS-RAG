@@ -3,21 +3,21 @@ civitas.ingestion.qdrant.pipeline
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Pipeline d'ingestion principal pour Qdrant.
 
-Orchestrate le flux complet:
+Flux complet:
   1. SCAN      — découverte récursive des fichiers (FileScanner)
-  2. FILTER    — déduplication via IngestionTracker
-  3. READ      — lecture du contenu brut
-  4. CHUNK     — découpage en chunks (TextChunker)
+  2. FILTER    — déduplication via IngestionTracker (skip si inchangé)
+  3. READ      — lecture robuste du contenu (text/yaml/pdf/docx...)
+  4. CHUNK     — découpage en chunks chevauchants (TextChunker)
   5. EMBED     — vectorisation (DocumentEmbedder)
-  6. UPSERT    — insertion dans Qdrant (CivitasQdrantClient)
-  7. TRACK     — enregistrement dans le tracker SQLite
+  6. UPSERT    — insertion batch dans Qdrant (CivitasQdrantClient)
+  7. TRACK     — enregistrement du résultat dans SQLite
 
 Caractéristiques:
-  · Incrémental: ne traite que les fichiers nouveaux ou modifiés
-  · Paramétrable: collection, répertoire, extensions, chunks...
-  · Dry-run: parse + chunk sans indexer
-  · Relançable à volonté (idempotent)
-  · Rapport détaillé après chaque run
+  · Incrémental  — traite uniquement les fichiers nouveaux ou modifiés
+  · Idempotent   — relançable à volonté, jamais de doublons
+  · Paramétrable — collection, chemin, extensions, chunks, domain, tags...
+  · Dry-run      — analyse complète sans écrire dans Qdrant
+  · Rapport      — résumé détaillé après chaque run (Rich ou plain)
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -48,7 +48,8 @@ class FileIngestionResult:
     file_path: str
     relative_path: str
     collection: str
-    status: str = "pending"          # new | modified | failed | skipped | dry_run
+    # Statuts: new | modified | failed | skipped | dry_run
+    status: str = "pending"
     chunks_count: int = 0
     point_ids: list[str] = field(default_factory=list)
     error: Optional[str] = None
@@ -71,10 +72,12 @@ class FileIngestionResult:
 class ScanIngestionReport:
     """Rapport complet d'un run d'ingestion."""
     scan_config: ScanConfig
-    started_at: datetime = field(default_factory=datetime.utcnow)
+    started_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)  # FIX: UTC-aware
+    )
     finished_at: Optional[datetime] = None
 
-    # Compteurs
+    # Compteurs globaux
     total_discovered: int = 0
     total_new: int = 0
     total_modified: int = 0
@@ -84,7 +87,7 @@ class ScanIngestionReport:
     total_points: int = 0
     total_duration_ms: int = 0
 
-    # Détails
+    # Détails par fichier
     results: list[FileIngestionResult] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -94,20 +97,24 @@ class ScanIngestionReport:
 
     @property
     def success_rate(self) -> float:
-        processed = self.total_new + self.total_modified + self.total_failed
-        if processed == 0:
+        """Taux de succès sur les fichiers effectivement traités (hors skips et dry_run)."""
+        # FIX: dry_run → total_new est incrémenté, mais pas total_points
+        # la success_rate doit compter correctement les dry_run comme succès
+        attempted = self.total_new + self.total_modified + self.total_failed
+        if attempted == 0:
             return 1.0
-        return (self.total_new + self.total_modified) / processed
+        return (self.total_new + self.total_modified) / attempted
 
     @property
     def duration_seconds(self) -> float:
-        if self.finished_at:
+        if self.finished_at and self.started_at:
             return (self.finished_at - self.started_at).total_seconds()
         return self.total_duration_ms / 1000
 
     def add_result(self, result: FileIngestionResult) -> None:
         self.results.append(result)
         self.total_duration_ms += result.duration_ms
+
         if result.status == "new":
             self.total_new += 1
             self.total_chunks += result.chunks_count
@@ -118,21 +125,20 @@ class ScanIngestionReport:
             self.total_points += len(result.point_ids)
         elif result.status == "skipped":
             self.total_skipped += 1
-        elif result.status in ("failed",):
+        elif result.status == "failed":
             self.total_failed += 1
             if result.error:
                 self.errors.append(f"{result.relative_path}: {result.error}")
         elif result.status == "dry_run":
+            # FIX: dry_run compte comme "new" dans les stats de traitement
+            # mais total_points reste 0 (rien écrit dans Qdrant)
             self.total_new += 1
             self.total_chunks += result.chunks_count
 
     def print_report(self) -> None:
-        """Afficher le rapport dans le terminal."""
+        """Afficher le rapport dans le terminal (Rich si disponible, sinon plain)."""
         try:
             from rich.console import Console
-            from rich.table import Table
-            from rich.panel import Panel
-            from rich import box
             console = Console()
             _print_rich_report(self, console)
         except ImportError:
@@ -140,60 +146,64 @@ class ScanIngestionReport:
 
 
 # ─────────────────────────────────────────────────────────────
-#  PIPELINE
+#  FILE READER
 # ─────────────────────────────────────────────────────────────
 
-# Extensions texte lisibles directement
-TEXT_EXTENSIONS = {
-    ".txt", ".md", ".markdown", ".rst", ".html", ".htm",
-    ".yaml", ".yml", ".json", ".xml", ".csv", ".toml",
-    ".tf", ".tfvars", ".sh", ".bash", ".conf", ".config",
-    ".ini", ".properties", ".env",
-    "Dockerfile", "Jenkinsfile", "Makefile", "Vagrantfile",
-}
-
-
 def _read_text(file_path: Path) -> Optional[str]:
-    """Lire le contenu texte d'un fichier."""
-    ext = file_path.suffix.lower() or file_path.name
+    """
+    Lire le contenu texte d'un fichier de façon robuste.
 
-    # Fichiers PDF
+    Supporte: texte brut (toutes encodings), YAML, JSON, Terraform, Shell,
+    Dockerfile, Jenkinsfile, Makefile, PDF (pypdf), DOCX (python-docx).
+    Retourne None si le fichier est vide ou illisible.
+    """
+    ext = file_path.suffix.lower()
+
+    # ── PDF ───────────────────────────────────────────────────
     if ext == ".pdf":
         try:
             import pypdf
             reader = pypdf.PdfReader(str(file_path))
-            texts = [page.extract_text() or "" for page in reader.pages]
-            return "\n\n".join(t for t in texts if t.strip())
+            pages  = [page.extract_text() or "" for page in reader.pages]
+            text   = "\n\n".join(t for t in pages if t.strip())
+            return text or None
         except Exception as e:
-            logger.warning("PDF read failed %s: %s", file_path, e)
+            logger.warning("PDF read failed %s: %s", file_path.name, e)
             return None
 
-    # Fichiers DOCX
+    # ── DOCX / DOC ────────────────────────────────────────────
     if ext in (".docx", ".doc"):
         try:
             import docx
-            doc = docx.Document(str(file_path))
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            doc  = docx.Document(str(file_path))
+            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            return text or None
         except Exception as e:
-            logger.warning("DOCX read failed %s: %s", file_path, e)
+            logger.warning("DOCX read failed %s: %s", file_path.name, e)
             return None
 
-    # Tous les fichiers texte
-    encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252", "iso-8859-1"]
-    content = file_path.read_bytes()
-    for enc in encodings:
+    # ── Texte brut (toutes encodings) ─────────────────────────
+    raw = file_path.read_bytes()
+    if not raw:
+        return None
+
+    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252", "iso-8859-1"):
         try:
-            return content.decode(enc)
+            return raw.decode(enc)
         except (UnicodeDecodeError, LookupError):
             continue
 
-    # Fallback: latin-1 with replace
-    return content.decode("latin-1", errors="replace")
+    # Fallback ultime : latin-1 avec remplacement des caractères illisibles
+    return raw.decode("latin-1", errors="replace")
 
+
+# ─────────────────────────────────────────────────────────────
+#  PIPELINE
+# ─────────────────────────────────────────────────────────────
 
 class QdrantIngestionPipeline:
     """
-    Pipeline d'ingestion Qdrant paramétrable.
+    Pipeline d'ingestion Qdrant paramétrable et idempotent.
 
     Usage minimal:
         config = QdrantIngestionConfig()
@@ -205,22 +215,23 @@ class QdrantIngestionPipeline:
         ))
         report.print_report()
 
-    Usage avancé (multi-scan):
+    Multi-scan:
         pipeline.ingest_many([
-            ScanConfig(source_path="/data/ansible", collection_name="ansible_docs"),
+            ScanConfig(source_path="/data/ansible",   collection_name="ansible_docs"),
             ScanConfig(source_path="/data/terraform", collection_name="terraform_docs"),
-            ScanConfig(source_path="/data/cicd", collection_name="cicd_docs"),
+            ScanConfig(source_path="/data/cicd",      collection_name="cicd_docs"),
         ])
     """
 
     def __init__(self, config: QdrantIngestionConfig) -> None:
-        self.config = config
+        self.config  = config
         self.tracker = IngestionTracker(config.tracker_db_path)
-        self.qdrant = CivitasQdrantClient.from_config(config)
+        self.qdrant  = CivitasQdrantClient.from_config(config)
         self._embedder: Optional[DocumentEmbedder] = None
 
     @property
     def embedder(self) -> DocumentEmbedder:
+        """Lazy-init de l'embedder singleton (partagé entre ingestion et search)."""
         if self._embedder is None:
             self._embedder = DocumentEmbedder.get_or_create(self.config.embedding)
         return self._embedder
@@ -231,69 +242,63 @@ class QdrantIngestionPipeline:
         """
         Lancer un scan d'ingestion complet.
 
-        Paramétrable via ScanConfig:
-          - source_path      : répertoire ou fichier à scanner
-          - collection_name  : collection Qdrant cible
-          - recursive        : scanner récursivement (défaut: True)
-          - skip_existing    : sauter les fichiers déjà ingérés et inchangés
-          - dry_run          : parser sans indexer
-          - allowed_extensions, chunk_size, domain, tags...
+        Args:
+            scan: ScanConfig — paramètres complets du scan.
+
+        Returns:
+            ScanIngestionReport — rapport détaillé du run.
         """
-        report = ScanIngestionReport(scan_config=scan)
+        report  = ScanIngestionReport(scan_config=scan)
         t_start = time.monotonic()
 
         logger.info(
-            "═══ Ingestion START ═══ collection='%s' path='%s'",
-            scan.collection_name, scan.source_path,
+            "═══ Ingestion START ═══  collection='%s'  path='%s'  dry_run=%s",
+            scan.collection_name, scan.source_path, scan.dry_run,
         )
 
-        # 1. Vérifier la connexion Qdrant
-        if not scan.dry_run:
-            is_in_memory = getattr(self.config, "qdrant_in_memory", False)
-            if not is_in_memory and not self.qdrant.health_check():
+        # 1. Health-check Qdrant (sauf dry-run et in-memory)
+        if not scan.dry_run and not getattr(self.config, "qdrant_in_memory", False):
+            if not self.qdrant.health_check():
                 raise ConnectionError(
-                    f"Cannot connect to Qdrant at {self.config.qdrant_host}:"
-                    f"{self.config.qdrant_port}. Start Qdrant first:\n"
+                    f"Cannot connect to Qdrant at "
+                    f"{self.config.qdrant_host}:{self.config.qdrant_port}.\n"
+                    "Start Qdrant with:\n"
                     "  docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant"
                 )
 
-        # 2. Créer la collection si nécessaire
+        # 2. Résoudre chunk_size/overlap (scan > collection > global)
+        #    FIX: utiliser None-check plutôt que falsiness (0 est une valeur valide)
+        col_config    = self.config.get_collection(scan.collection_name)
+        chunk_size    = scan.chunk_size    if scan.chunk_size    is not None else col_config.chunk_size
+        chunk_overlap = scan.chunk_overlap if scan.chunk_overlap is not None else col_config.chunk_overlap
+        chunker       = TextChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+        # 3. Créer la collection si nécessaire (skip en dry-run)
         if not scan.dry_run:
-            col_config = self.config.get_collection(scan.collection_name)
-            chunk_size = scan.chunk_size or col_config.chunk_size
-            chunk_overlap = scan.chunk_overlap or col_config.chunk_overlap
             self.qdrant.ensure_collection(
                 name=scan.collection_name,
                 vector_size=self.config.embedding.vector_size,
                 collection_config=col_config,
             )
-        else:
-            chunk_size = scan.chunk_size
-            chunk_overlap = scan.chunk_overlap
 
-        chunker = TextChunker(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-        )
-
-        # 3. Scanner les fichiers
+        # 4. Scanner les fichiers
         scanner = FileScanner(
             allowed_extensions=self.config.effective_extensions(scan),
             excluded_patterns=scan.excluded_patterns,
             max_file_size_mb=scan.max_file_size_mb,
             recursive=scan.recursive,
         )
-        scan_result = scanner.scan(scan.source_path)
-        report.total_discovered = scan_result.total_discovered
+        scan_result              = scanner.scan(scan.source_path)
+        report.total_discovered  = scan_result.total_discovered
 
         logger.info(
-            "Discovered %d files in '%s' (%d skipped)",
+            "Discovered %d files in '%s' (%d filtered out)",
             scan_result.total_discovered,
             scan.source_path,
             scan_result.total_skipped,
         )
 
-        # 4. Traiter chaque fichier
+        # 5. Traiter chaque fichier
         for discovered_file in scan_result.discovered:
             result = self._process_file(
                 discovered_file=discovered_file,
@@ -303,11 +308,11 @@ class QdrantIngestionPipeline:
             )
             report.add_result(result)
 
-        report.finished_at = datetime.utcnow()
+        report.finished_at = datetime.now(timezone.utc)  # FIX: UTC-aware
         elapsed = time.monotonic() - t_start
         logger.info(
-            "═══ Ingestion END ═══ new=%d modified=%d skipped=%d failed=%d "
-            "chunks=%d duration=%.1fs",
+            "═══ Ingestion END ═══  new=%d  modified=%d  skipped=%d  "
+            "failed=%d  chunks=%d  duration=%.1fs",
             report.total_new, report.total_modified,
             report.total_skipped, report.total_failed,
             report.total_chunks, elapsed,
@@ -315,12 +320,14 @@ class QdrantIngestionPipeline:
         return report
 
     def ingest_many(self, scans: list[ScanConfig]) -> list[ScanIngestionReport]:
-        """Lancer plusieurs scans séquentiellement."""
+        """Lancer plusieurs scans séquentiellement et retourner tous les rapports."""
         reports = []
         for i, scan in enumerate(scans, 1):
-            logger.info("--- Scan %d/%d: %s → %s ---", i, len(scans), scan.source_path, scan.collection_name)
-            report = self.ingest(scan)
-            reports.append(report)
+            logger.info(
+                "─── Scan %d/%d: '%s' → '%s' ───",
+                i, len(scans), scan.source_path, scan.collection_name,
+            )
+            reports.append(self.ingest(scan))
         return reports
 
     # ── File Processing ────────────────────────────────────────
@@ -332,10 +339,10 @@ class QdrantIngestionPipeline:
         chunker: TextChunker,
         dry_run: bool,
     ) -> FileIngestionResult:
-        """Traiter un fichier unique à travers toutes les étapes."""
-        t0 = time.monotonic()
-        file_path = str(discovered_file.path)
-        rel_path = discovered_file.relative_path
+        """Traiter un fichier unique à travers toutes les étapes du pipeline."""
+        t0         = time.monotonic()
+        file_path  = str(discovered_file.path)
+        rel_path   = discovered_file.relative_path
         collection = scan.collection_name
 
         result = FileIngestionResult(
@@ -345,66 +352,69 @@ class QdrantIngestionPipeline:
         )
 
         try:
-            # Déduplication
+            # ── Étape 1: Déduplication ────────────────────────
             should_process, reason = self.tracker.should_ingest(
                 file_path, collection, skip_existing=scan.skip_existing
             )
 
             if not should_process:
                 result.status = "skipped"
-                result.duration_ms = int((time.monotonic() - t0) * 1000)
                 logger.debug("SKIP [%s] %s (unchanged)", collection, rel_path)
                 return result
 
-            # Supprimer les anciens points si fichier modifié
+            # ── Étape 2: Nettoyage des anciens points (fichier modifié) ──
             if reason == "modified" and not dry_run:
-                old_point_ids = self.tracker.get_point_ids(file_path, collection)
-                if old_point_ids:
-                    self.qdrant.delete_points_by_ids(collection, old_point_ids)
-                    logger.debug("Deleted %d old points for modified file: %s", len(old_point_ids), rel_path)
+                old_ids = self.tracker.get_point_ids(file_path, collection)
+                if old_ids:
+                    self.qdrant.delete_points_by_ids(collection, old_ids)
+                    logger.debug(
+                        "Deleted %d stale points for modified file: %s",
+                        len(old_ids), rel_path,
+                    )
 
-            # Lire le contenu
+            # ── Étape 3: Lecture du contenu ───────────────────
             text = _read_text(discovered_file.path)
             if not text or not text.strip():
-                logger.warning("Empty content: %s", rel_path)
+                logger.warning("Empty or unreadable content: %s", rel_path)
                 result.status = "failed"
-                result.error = "Empty or unreadable content"
+                result.error  = "Empty or unreadable content"
                 if not dry_run:
-                    self.tracker.mark_failed(file_path, collection, "Empty content")
-                result.duration_ms = int((time.monotonic() - t0) * 1000)
+                    self.tracker.mark_failed(file_path, collection, result.error)
                 return result
 
-            # Chunker
+            # ── Étape 4: Chunking ─────────────────────────────
             chunks = chunker.chunk_with_context(text, rel_path)
             if not chunks:
                 result.status = "failed"
-                result.error = "No chunks produced"
-                result.duration_ms = int((time.monotonic() - t0) * 1000)
+                result.error  = "No chunks produced from content"
+                if not dry_run:
+                    self.tracker.mark_failed(file_path, collection, result.error)
                 return result
 
             result.chunks_count = len(chunks)
 
+            # ── Dry-run: s'arrêter ici ────────────────────────
             if dry_run:
                 result.status = "dry_run"
-                result.duration_ms = int((time.monotonic() - t0) * 1000)
                 logger.info(
                     "[DRY RUN] %s → %d chunks (would index into '%s')",
                     rel_path, len(chunks), collection,
                 )
                 return result
 
-            # Embedder les chunks
+            # ── Étape 5: Embedding ────────────────────────────
             chunk_texts = [c.text for c in chunks]
-            vectors = self.embedder.embed_texts(chunk_texts)
+            vectors     = self.embedder.embed_texts(chunk_texts)
 
             if len(vectors) != len(chunks):
                 raise ValueError(
-                    f"Vector count mismatch: {len(vectors)} != {len(chunks)}"
+                    f"Embedding mismatch: got {len(vectors)} vectors "
+                    f"for {len(chunks)} chunks in {rel_path}"
                 )
 
-            # Construire les points Qdrant
+            # ── Étape 6: Construire et upserter les points ────
             col_config = self.config.get_collection(collection)
-            tags = list(set(scan.tags + col_config.default_tags))
+            tags   = sorted(set(scan.tags + col_config.default_tags))
             domain = scan.domain or col_config.default_domain
 
             points = [
@@ -425,17 +435,19 @@ class QdrantIngestionPipeline:
                 for i in range(len(chunks))
             ]
 
-            # Upsert dans Qdrant
-            upserted = self.qdrant.upsert_points(
+            # FIX: variable 'upserted' supprimée — upsert_points retourne le count
+            # mais on n'en a pas besoin ici (on utilise len(points))
+            self.qdrant.upsert_points(
                 collection_name=collection,
                 points=points,
                 batch_size=self.config.batch_size,
             )
 
             result.point_ids = [p.id for p in points]
-            result.status = reason if reason in ("new", "modified") else "new"
+            # FIX: statut = reason réel (new ou modified), jamais "pending"
+            result.status    = reason if reason in ("new", "modified") else "new"
 
-            # Tracker
+            # ── Étape 7: Tracker ──────────────────────────────
             self.tracker.mark_success(
                 file_path=file_path,
                 collection=collection,
@@ -444,19 +456,19 @@ class QdrantIngestionPipeline:
             )
 
             logger.info(
-                "✓ [%s] %s → %d chunks (%s)",
-                collection, rel_path, len(chunks), reason,
+                "✓ [%s] %s → %d chunks, %d points (%s)",
+                collection, rel_path, len(chunks), len(points), reason,
             )
 
         except Exception as exc:
             result.status = "failed"
-            result.error = f"{type(exc).__name__}: {exc}"
-            logger.error("✗ [%s] %s — %s", collection, rel_path, exc)
+            result.error  = f"{type(exc).__name__}: {exc}"
+            logger.error("✗ [%s] %s — %s", collection, rel_path, exc, exc_info=True)
             if not dry_run:
                 try:
-                    self.tracker.mark_failed(file_path, collection, str(exc))
+                    self.tracker.mark_failed(file_path, collection, result.error)
                 except Exception:
-                    pass
+                    pass  # Ne pas masquer l'erreur principale
 
         finally:
             result.duration_ms = int((time.monotonic() - t0) * 1000)
@@ -465,45 +477,55 @@ class QdrantIngestionPipeline:
 
     # ── Utilities ──────────────────────────────────────────────
 
-    def scan_only(self, source_path: str, collection_name: str) -> None:
+    def scan_only(
+        self,
+        source_path: str,
+        allowed_extensions: Optional[list[str]] = None,
+        max_files: int = 200,
+    ) -> None:
         """
         Afficher l'arborescence des fichiers qui seraient ingérés.
-        Ne modifie rien.
+        Ne modifie rien (ni Qdrant ni le tracker).
         """
         scanner = FileScanner(
-            allowed_extensions=self.config.allowed_extensions,
+            allowed_extensions=allowed_extensions or self.config.allowed_extensions,
         )
-        scanner.print_tree(source_path)
+        scanner.print_tree(source_path, max_files=max_files)
 
     def reset_collection_tracker(self, collection_name: str) -> int:
         """
-        Réinitialiser le tracker pour une collection.
-        La prochaine ingestion traitera TOUS les fichiers comme nouveaux.
+        Réinitialiser le tracker d'une collection.
+        Le prochain `ingest()` traitera tous les fichiers comme nouveaux.
         """
         return self.tracker.reset_collection(collection_name)
 
     def reset_all_trackers(self) -> int:
-        """Réinitialiser tous les trackers (réingestion complète)."""
+        """Réinitialiser tous les trackers (réingestion totale au prochain run)."""
         return self.tracker.reset_all()
 
     def status(self, collection_name: Optional[str] = None) -> dict:
-        """Statut du système d'ingestion."""
-        tracker_stats = self.tracker.stats(collection_name)
+        """
+        Retourne le statut complet du système d'ingestion:
+          - Statistiques tracker SQLite
+          - Liste des collections connues
+          - Info Qdrant (si disponible)
+        """
+        tracker_stats       = self.tracker.stats(collection_name)
         tracker_collections = self.tracker.list_collections()
 
-        qdrant_info = {}
         try:
-            if collection_name:
-                qdrant_info = self.qdrant.get_collection_info(collection_name)
-            else:
-                qdrant_info = self.qdrant.get_server_info()
+            qdrant_info = (
+                self.qdrant.get_collection_info(collection_name)
+                if collection_name
+                else self.qdrant.get_server_info()
+            )
         except Exception as e:
             qdrant_info = {"error": str(e)}
 
         return {
-            "tracker": tracker_stats,
+            "tracker":             tracker_stats,
             "tracker_collections": tracker_collections,
-            "qdrant": qdrant_info,
+            "qdrant":              qdrant_info,
         }
 
 
@@ -512,43 +534,40 @@ class QdrantIngestionPipeline:
 # ─────────────────────────────────────────────────────────────
 
 def _print_rich_report(report: ScanIngestionReport, console) -> None:
+    """Afficher le rapport avec Rich (couleurs, tableau)."""
     from rich.table import Table
-    from rich.panel import Panel
     from rich import box
-    from rich.text import Text
 
-    scan = report.scan_config
+    scan   = report.scan_config
     is_dry = scan.dry_run
 
     title = f"CIVITAS INGESTION {'[DRY RUN] ' if is_dry else ''}REPORT"
-    console.print(f"\n[bold cyan]{'═' * 60}[/]")
+    console.print(f"\n[bold cyan]{'═' * 62}[/]")
     console.print(f"[bold white]  {title}[/]")
-    console.print(f"[bold cyan]{'═' * 60}[/]")
+    console.print(f"[bold cyan]{'═' * 62}[/]")
+    console.print(f"  [dim]Collection :[/] [cyan]{scan.collection_name}[/]")
+    console.print(f"  [dim]Source     :[/] {scan.source_path}")
+    console.print(f"  [dim]Duration   :[/] {report.duration_seconds:.1f}s")
+    console.print(f"  [dim]Discovered :[/] {report.total_discovered} files\n")
 
-    # Résumé
-    console.print(f"  [dim]Collection  :[/] [cyan]{scan.collection_name}[/]")
-    console.print(f"  [dim]Source      :[/] {scan.source_path}")
-    console.print(f"  [dim]Duration    :[/] {report.duration_seconds:.1f}s")
-    console.print(f"  [dim]Discovered  :[/] {report.total_discovered} files")
-    console.print()
-
-    # Tableau des compteurs
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
-    table.add_column("Metric", style="dim")
-    table.add_column("Count", justify="right")
+    table.add_column("Metric",  style="dim")
+    table.add_column("Count",   justify="right")
 
-    table.add_row("✓  New / Indexed", f"[green]{report.total_new}[/]")
+    table.add_row("✓  New / Indexed",        f"[green]{report.total_new}[/]")
     table.add_row("↻  Modified / Re-indexed", f"[yellow]{report.total_modified}[/]")
-    table.add_row("⏭  Skipped (unchanged)", f"[dim]{report.total_skipped}[/]")
-    table.add_row("✗  Failed", f"[red]{report.total_failed}[/]" if report.total_failed else "0")
-    table.add_row("⬡  Chunks produced", f"[cyan]{report.total_chunks}[/]")
+    table.add_row("⏭  Skipped (unchanged)",   f"[dim]{report.total_skipped}[/]")
+    table.add_row(
+        "✗  Failed",
+        f"[red]{report.total_failed}[/]" if report.total_failed else "[dim]0[/]",
+    )
+    table.add_row("⬡  Chunks produced",      f"[cyan]{report.total_chunks}[/]")
     if not is_dry:
         table.add_row("⬡  Points in Qdrant", f"[cyan]{report.total_points}[/]")
-    table.add_row("✔  Success rate", f"{report.success_rate:.0%}")
+    table.add_row("✔  Success rate",         f"{report.success_rate:.0%}")
 
     console.print(table)
 
-    # Erreurs
     if report.errors:
         console.print(f"\n  [red]Errors ({len(report.errors)}):[/]")
         for err in report.errors[:10]:
@@ -556,13 +575,15 @@ def _print_rich_report(report: ScanIngestionReport, console) -> None:
         if len(report.errors) > 10:
             console.print(f"    [dim]... and {len(report.errors) - 10} more[/]")
 
-    console.print(f"[bold cyan]{'═' * 60}[/]\n")
+    console.print(f"[bold cyan]{'═' * 62}[/]\n")
 
 
 def _print_plain_report(report: ScanIngestionReport) -> None:
-    print("\n" + "═" * 60)
+    """Afficher le rapport sans dépendance Rich."""
+    sep = "═" * 62
+    print(f"\n{sep}")
     print("  CIVITAS INGESTION REPORT")
-    print("═" * 60)
+    print(sep)
     print(f"  Collection  : {report.scan_config.collection_name}")
     print(f"  Source      : {report.scan_config.source_path}")
     print(f"  Discovered  : {report.total_discovered}")
@@ -571,10 +592,11 @@ def _print_plain_report(report: ScanIngestionReport) -> None:
     print(f"  Skipped     : {report.total_skipped}")
     print(f"  Failed      : {report.total_failed}")
     print(f"  Chunks      : {report.total_chunks}")
+    print(f"  Points      : {report.total_points}")
     print(f"  Success rate: {report.success_rate:.0%}")
     print(f"  Duration    : {report.duration_seconds:.1f}s")
     if report.errors:
         print(f"\n  Errors ({len(report.errors)}):")
         for err in report.errors[:10]:
             print(f"    · {err}")
-    print("═" * 60 + "\n")
+    print(f"{sep}\n")

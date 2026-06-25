@@ -22,7 +22,7 @@ Chaque point Qdrant stocke dans son payload:
   - tags            : tags associés
   - depth           : profondeur dans l'arborescence
   - file_size_bytes : taille du fichier source
-  - ingested_at     : timestamp d'ingestion
+  - ingested_at     : timestamp d'ingestion (UTC ISO-8601)
 """
 
 from __future__ import annotations
@@ -30,12 +30,22 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Optional
 
-from civitas.ingestion.qdrant.config import CollectionConfig, QdrantIngestionConfig
+if TYPE_CHECKING:
+    from civitas.ingestion.qdrant.config import CollectionConfig, QdrantIngestionConfig
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def _utcnow_iso() -> str:
+    """Retourne l'heure UTC courante en ISO-8601 (aware, sans utcnow deprecated)."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -61,10 +71,10 @@ class QdrantPoint:
         extension: str,
         collection: str,
         domain: str = "",
-        tags: list[str] = None,
+        tags: Optional[list[str]] = None,       # FIX: pas de mutable default
         depth: int = 0,
         file_size_bytes: int = 0,
-        extra_payload: dict = None,
+        extra_payload: Optional[dict[str, Any]] = None,  # FIX: pas de mutable default
     ) -> "QdrantPoint":
         return cls(
             id=str(uuid.uuid4()),
@@ -78,10 +88,10 @@ class QdrantPoint:
                 "chunk_index": chunk_index,
                 "chunk_text": chunk_text,
                 "domain": domain,
-                "tags": tags or [],
+                "tags": tags if tags is not None else [],
                 "depth": depth,
                 "file_size_bytes": file_size_bytes,
-                "ingested_at": datetime.utcnow().isoformat(),
+                "ingested_at": _utcnow_iso(),   # FIX: datetime.utcnow() → timezone-aware
                 **(extra_payload or {}),
             },
         )
@@ -196,8 +206,7 @@ class CivitasQdrantClient:
         """Info sur le serveur Qdrant."""
         try:
             client = self._get_client()
-            info = client.get_collection.__module__
-            collections = client.get_collections()
+            collections = client.get_collections()   # FIX: ligne fantôme supprimée
             return {
                 "status": "ok",
                 "collections_count": len(collections.collections),
@@ -215,13 +224,18 @@ class CivitasQdrantClient:
         return [c.name for c in result.collections]
 
     def collection_exists(self, name: str) -> bool:
-        return name in self.list_collections()
+        """Vérifie si une collection existe via l'API native (plus efficace que list)."""
+        try:
+            # FIX: utiliser collection_exists natif du client plutôt que list_collections()
+            return self._get_client().collection_exists(name)
+        except Exception:
+            return name in self.list_collections()
 
     def ensure_collection(
         self,
         name: str,
         vector_size: int,
-        collection_config: Optional[CollectionConfig] = None,
+        collection_config: Optional["CollectionConfig"] = None,
         distance: str = "Cosine",
     ) -> bool:
         """
@@ -232,7 +246,7 @@ class CivitasQdrantClient:
             True si créée, False si déjà existante.
         """
         from qdrant_client.models import (
-            Distance, VectorParams, HnswConfigDiff, OptimizersConfigDiff
+            Distance, VectorParams, HnswConfigDiff, OptimizersConfigDiff,
         )
 
         distance_map = {
@@ -247,12 +261,15 @@ class CivitasQdrantClient:
 
         cfg_distance = distance
         on_disk_payload = True
+        # FIX: replication_factor maintenant transmis à Qdrant
+        replication_factor = 1
         if collection_config:
             cfg_distance = collection_config.distance
             on_disk_payload = collection_config.on_disk_payload
+            replication_factor = getattr(collection_config, "replication_factor", 1)
 
         client = self._get_client()
-        client.create_collection(
+        create_kwargs: dict[str, Any] = dict(
             collection_name=name,
             vectors_config=VectorParams(
                 size=vector_size,
@@ -269,6 +286,11 @@ class CivitasQdrantClient:
             ),
             on_disk_payload=on_disk_payload,
         )
+        # replication_factor > 1 uniquement sur un cluster multi-nœuds
+        if replication_factor > 1:
+            create_kwargs["replication_factor"] = replication_factor
+
+        client.create_collection(**create_kwargs)
         logger.info(
             "Collection '%s' created (dim=%d, dist=%s)", name, vector_size, cfg_distance
         )
@@ -295,8 +317,7 @@ class CivitasQdrantClient:
         """Supprimer une collection (irréversible)."""
         if not self.collection_exists(name):
             return False
-        client = self._get_client()
-        client.delete_collection(name)
+        self._get_client().delete_collection(name)
         logger.info("Collection '%s' deleted", name)
         return True
 
@@ -323,11 +344,7 @@ class CivitasQdrantClient:
         for i in range(0, len(points), batch_size):
             batch = points[i : i + batch_size]
             qdrant_points = [
-                PointStruct(
-                    id=p.id,
-                    vector=p.vector,
-                    payload=p.payload,
-                )
+                PointStruct(id=p.id, vector=p.vector, payload=p.payload)
                 for p in batch
             ]
             client.upsert(
@@ -351,14 +368,13 @@ class CivitasQdrantClient:
         collection_name: str,
         point_ids: list[str],
     ) -> int:
-        """Supprimer des points par leurs IDs."""
+        """Supprimer des points par leurs IDs (ex: mise à jour d'un fichier modifié)."""
         if not point_ids or not self.collection_exists(collection_name):
             return 0
 
         from qdrant_client.models import PointIdsList
 
-        client = self._get_client()
-        client.delete(
+        self._get_client().delete(
             collection_name=collection_name,
             points_selector=PointIdsList(points=point_ids),
             wait=True,
@@ -372,26 +388,24 @@ class CivitasQdrantClient:
         file_path: str,
     ) -> int:
         """
-        Supprimer tous les points d'un fichier (par file_path dans le payload).
-        Utile pour nettoyer avant une réingestion.
+        Supprimer tous les points d'un fichier via filtre payload (file_path).
+        Utile pour forcer une réingestion propre sans connaître les IDs.
         """
+        if not self.collection_exists(collection_name):
+            return 0
+
         from qdrant_client.models import Filter, FieldCondition, MatchValue
 
-        client = self._get_client()
-        result = client.delete(
+        self._get_client().delete(
             collection_name=collection_name,
             points_selector=Filter(
-                must=[
-                    FieldCondition(
-                        key="file_path",
-                        match=MatchValue(value=file_path),
-                    )
-                ]
+                must=[FieldCondition(key="file_path", match=MatchValue(value=file_path))]
             ),
             wait=True,
         )
         logger.debug("Deleted points for file '%s' from '%s'", file_path, collection_name)
-        return 0  # Qdrant ne retourne pas le count dans ce cas
+        # Qdrant ne retourne pas le count dans ce cas — retourner -1 pour signaler l'exécution
+        return -1
 
     # ── Search ──────────────────────────────────────────────────
 
@@ -407,6 +421,15 @@ class CivitasQdrantClient:
     ) -> list[SearchResult]:
         """
         Recherche sémantique dans une collection.
+
+        Args:
+            collection_name:  Collection à interroger
+            query_vector:     Vecteur de la requête (même dimension que les chunks)
+            top_k:            Nombre de résultats à retourner
+            score_threshold:  Score minimum (0.0 = pas de filtre)
+            filter_domain:    Filtrer par domaine métier (payload.domain)
+            filter_tags:      Filtrer par tags (OR — payload.tags contient au moins un)
+            filter_extension: Filtrer par extension de fichier (payload.extension)
         """
         from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
 
@@ -426,18 +449,14 @@ class CivitasQdrantClient:
 
         search_filter = Filter(must=must_conditions) if must_conditions else None
 
-        client = self._get_client()
-
-        # Nouvelle API Qdrant: query_points
-        response = client.query_points(
+        response = self._get_client().query_points(
             collection_name=collection_name,
             query=query_vector,
             limit=top_k,
-            score_threshold=score_threshold if score_threshold > 0 else None,
+            score_threshold=score_threshold if score_threshold > 0.0 else None,
             query_filter=search_filter,
             with_payload=True,
         )
-        hits = response.points
 
         return [
             SearchResult(
@@ -452,7 +471,7 @@ class CivitasQdrantClient:
                 domain=hit.payload.get("domain", ""),
                 payload=hit.payload,
             )
-            for hit in hits
+            for hit in response.points
         ]
 
     def search_across_collections(
@@ -464,12 +483,17 @@ class CivitasQdrantClient:
     ) -> list[SearchResult]:
         """
         Recherche dans plusieurs collections simultanément.
-        Les résultats sont fusionnés et re-triés par score.
+
+        FIX: récupère la liste des collections existantes une seule fois
+        pour éviter N appels à collection_exists() (chacun appelle list_collections).
+        Les résultats sont fusionnés et re-triés par score décroissant.
         """
+        # FIX: un seul appel list_collections au lieu de N appels collection_exists
+        existing = set(self.list_collections())
         all_results: list[SearchResult] = []
 
         for collection in collection_names:
-            if not self.collection_exists(collection):
+            if collection not in existing:
                 continue
             try:
                 results = self.search(
@@ -482,7 +506,6 @@ class CivitasQdrantClient:
             except Exception as e:
                 logger.warning("Search failed in collection '%s': %s", collection, e)
 
-        # Re-trier par score décroissant
         all_results.sort(key=lambda r: r.score, reverse=True)
         return all_results[:top_k]
 
@@ -490,6 +513,6 @@ class CivitasQdrantClient:
         """Nombre de points dans une collection."""
         try:
             info = self.get_collection_info(collection_name)
-            return info.get("points_count", 0)
+            return info.get("points_count", 0) or 0
         except Exception:
             return 0

@@ -31,17 +31,18 @@ class EmbeddingConfig:
     Configuration du modèle d'embedding.
 
     Providers supportés:
-      - sentence-transformers (local, gratuit)
-      - openai (API)
+      - sentence-transformers  — local, gratuit, recommandé en production
+      - openai                 — API (nécessite OPENAI_API_KEY)
+      - tfidf-local            — offline/test, sans réseau, basé scikit-learn
     """
     provider: str = "sentence-transformers"
     # Pour sentence-transformers — modèles recommandés:
-    #   all-MiniLM-L6-v2          →  384 dims, très rapide
-    #   all-mpnet-base-v2          →  768 dims, meilleure qualité
-    #   paraphrase-multilingual-v3 →  768 dims, multilingue (FR+EN)
+    #   all-MiniLM-L6-v2                    →  384 dims, très rapide
+    #   all-mpnet-base-v2                   →  768 dims, meilleure qualité
+    #   paraphrase-multilingual-mpnet-base-v2 → 768 dims, multilingue (FR+EN+ES...)
     model_name: str = "all-MiniLM-L6-v2"
-    vector_size: int = 384           # Doit correspondre au modèle
-    batch_size: int = 64             # Nombre de textes à embedder en une fois
+    vector_size: int = 384           # DOIT correspondre au modèle
+    batch_size: int = 64             # Textes à embedder en une passe
     device: str = "cpu"              # cpu | cuda | mps
     normalize_embeddings: bool = True
 
@@ -51,9 +52,11 @@ class EmbeddingConfig:
     )
     openai_model: str = "text-embedding-3-small"
 
+    # ── Profils prêts à l'emploi ──────────────────────────────
+
     @classmethod
     def multilingual(cls) -> "EmbeddingConfig":
-        """Profil multilingue (FR/EN/AR/ES...)."""
+        """Profil multilingue (FR/EN/AR/ES...) — 768 dims."""
         return cls(
             model_name="paraphrase-multilingual-mpnet-base-v2",
             vector_size=768,
@@ -61,7 +64,7 @@ class EmbeddingConfig:
 
     @classmethod
     def high_quality(cls) -> "EmbeddingConfig":
-        """Profil haute qualité (plus lent mais précis)."""
+        """Profil haute qualité (plus lent mais meilleur) — 768 dims."""
         return cls(
             model_name="all-mpnet-base-v2",
             vector_size=768,
@@ -69,11 +72,21 @@ class EmbeddingConfig:
 
     @classmethod
     def openai_small(cls) -> "EmbeddingConfig":
-        """Profil OpenAI text-embedding-3-small."""
+        """Profil OpenAI text-embedding-3-small — 1536 dims."""
         return cls(
             provider="openai",
             model_name="text-embedding-3-small",
             vector_size=1536,
+        )
+
+    @classmethod
+    def offline_test(cls, vector_size: int = 128) -> "EmbeddingConfig":
+        """Profil offline pour tests/CI sans accès réseau — TF-IDF + SVD."""
+        return cls(
+            provider="tfidf-local",
+            model_name="tfidf",
+            vector_size=vector_size,
+            batch_size=32,
         )
 
 
@@ -90,17 +103,19 @@ class CollectionConfig:
     de documents (ex: ansible_docs, terraform_docs, cicd_docs...).
     """
     name: str                                   # Nom de la collection Qdrant
-    description: str = ""                       # Description optionnelle
+    description: str = ""                       # Description libre
     distance: str = "Cosine"                    # Cosine | Euclid | Dot
-    on_disk_payload: bool = True                # Stocker les payloads sur disque
-    replication_factor: int = 1
-    # Extensions autorisées pour CETTE collection (None = config globale)
+    on_disk_payload: bool = True                # Payloads stockés sur disque (prod)
+    replication_factor: int = 1                 # > 1 pour cluster multi-nœuds
+
+    # Extensions autorisées pour CETTE collection (None = hérite config globale)
     allowed_extensions: Optional[list[str]] = None
-    # Taille de chunk spécifique à cette collection
+
+    # Chunking spécifique à cette collection (surcharge config globale)
     chunk_size: int = 512
     chunk_overlap: int = 64
 
-    # Tags/métadonnées fixes injectés dans tous les points de cette collection
+    # Métadonnées injectées automatiquement dans tous les points
     default_tags: list[str] = field(default_factory=list)
     default_domain: str = ""
 
@@ -111,6 +126,7 @@ class CollectionConfig:
             description=data.get("description", ""),
             distance=data.get("distance", "Cosine"),
             on_disk_payload=data.get("on_disk_payload", True),
+            replication_factor=data.get("replication_factor", 1),
             allowed_extensions=data.get("allowed_extensions"),
             chunk_size=data.get("chunk_size", 512),
             chunk_overlap=data.get("chunk_overlap", 64),
@@ -123,12 +139,22 @@ class CollectionConfig:
 #  SCAN CONFIG
 # ─────────────────────────────────────────────────────────────
 
+# Patterns exclus par défaut (couvre les artefacts system + dev courants)
+DEFAULT_EXCLUDED_PATTERNS: list[str] = [
+    "*.tmp", "*.log", ".DS_Store", "~$*", "Thumbs.db",
+    "*.pyc", "*.pyo", "__pycache__", ".git", ".svn",
+    "*.swp", "*.swo", "node_modules", ".venv", "venv",
+    "*.egg-info", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+]
+
+
 @dataclass
 class ScanConfig:
     """
     Configuration d'un scan d'ingestion.
 
-    Un scan = une cible (répertoire ou fichier) + une collection de destination.
+    Un scan = une cible (répertoire ou fichier) + une collection Qdrant
+    + options de filtrage, chunking et métadonnées.
     Plusieurs scans peuvent être lancés dans une même session.
     """
     # --- Cible ---
@@ -137,24 +163,23 @@ class ScanConfig:
 
     # --- Filtrage ---
     recursive: bool = True                      # Scanner récursivement
-    allowed_extensions: Optional[list[str]] = None  # Surcharge la config globale
-    excluded_patterns: list[str] = field(default_factory=lambda: [
-        "*.tmp", "*.log", ".DS_Store", "~$*", "Thumbs.db", "*.pyc",
-        "__pycache__", ".git", "*.swp",
-    ])
+    allowed_extensions: Optional[list[str]] = None  # Surcharge config globale si défini
+    excluded_patterns: list[str] = field(
+        default_factory=lambda: list(DEFAULT_EXCLUDED_PATTERNS)  # FIX: copie complète
+    )
     max_file_size_mb: float = 100.0
 
     # --- Pipeline ---
     chunk_size: int = 512
     chunk_overlap: int = 64
-    dry_run: bool = False                       # Parser sans indexer
+    dry_run: bool = False                       # Analyse sans indexer dans Qdrant
 
-    # --- Métadonnées injectées ---
+    # --- Métadonnées injectées dans les points ---
     domain: str = ""
     tags: list[str] = field(default_factory=list)
 
     # --- Déduplication ---
-    skip_existing: bool = True                  # Ne pas réindexer les fichiers déjà traités
+    skip_existing: bool = True                  # Sauter les fichiers inchangés
 
     @property
     def source_path_obj(self) -> Path:
@@ -167,9 +192,8 @@ class ScanConfig:
             collection_name=data["collection_name"],
             recursive=data.get("recursive", True),
             allowed_extensions=data.get("allowed_extensions"),
-            excluded_patterns=data.get("excluded_patterns", [
-                "*.tmp", "*.log", ".DS_Store", "~$*",
-            ]),
+            # FIX: si absent du YAML → utiliser la liste complète par défaut
+            excluded_patterns=data.get("excluded_patterns", list(DEFAULT_EXCLUDED_PATTERNS)),
             max_file_size_mb=data.get("max_file_size_mb", 100.0),
             chunk_size=data.get("chunk_size", 512),
             chunk_overlap=data.get("chunk_overlap", 64),
@@ -184,16 +208,16 @@ class ScanConfig:
 #  GLOBAL INGESTION CONFIG
 # ─────────────────────────────────────────────────────────────
 
-# Extensions supportées par défaut (inclut les fichiers DevOps/IaC)
-DEFAULT_ALLOWED_EXTENSIONS = [
-    # Documents bureautiques
+# Extensions supportées par défaut (DevOps/IaC + documents bureautiques)
+DEFAULT_ALLOWED_EXTENSIONS: list[str] = [
+    # Documents
     ".pdf", ".docx", ".doc", ".txt", ".md", ".html", ".htm",
     ".csv", ".json", ".xml", ".xlsx", ".pptx",
-    # Code & IaC (pour DevOps)
+    # IaC & Config
     ".yml", ".yaml", ".tf", ".tfvars", ".sh", ".conf", ".config",
     ".ini", ".toml", ".env", ".properties",
-    # Fichiers texte génériques sans extension particulière
-    "Jenkinsfile", "Dockerfile", "Makefile",
+    # Fichiers reconnus sans extension (par nom exact)
+    "Jenkinsfile", "Dockerfile", "Makefile", "Vagrantfile",
 ]
 
 
@@ -202,7 +226,9 @@ class QdrantIngestionConfig:
     """
     Configuration globale du système d'ingestion Qdrant.
 
-    Peut être chargée depuis un fichier YAML (voir QdrantIngestionConfig.from_yaml).
+    Peut être chargée depuis un fichier YAML via from_yaml(),
+    ou instanciée programmatiquement avec des valeurs par défaut.
+    Toutes les valeurs sont surchargeable via variables d'environnement.
     """
 
     # --- Connexion Qdrant ---
@@ -215,12 +241,14 @@ class QdrantIngestionConfig:
     qdrant_api_key: Optional[str] = field(
         default_factory=lambda: os.getenv("QDRANT_API_KEY")
     )
+    # URL complète (Qdrant Cloud) — prend la priorité sur host+port
     qdrant_url: Optional[str] = field(
         default_factory=lambda: os.getenv("QDRANT_URL")
-    )  # Si Qdrant Cloud: https://xxx.cloud.qdrant.io
+    )
+    # Mode in-memory (tests, dev sans serveur Qdrant)
     qdrant_in_memory: bool = field(
         default_factory=lambda: os.getenv("QDRANT_IN_MEMORY", "false").lower() == "true"
-    )  # Mode in-memory (tests, dev sans serveur)
+    )
 
     # --- Embedding ---
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
@@ -228,7 +256,7 @@ class QdrantIngestionConfig:
     # --- Collections définies ---
     collections: dict[str, CollectionConfig] = field(default_factory=dict)
 
-    # --- Extensions par défaut ---
+    # --- Extensions par défaut (héritées si scan/collection ne définissent pas les leurs) ---
     allowed_extensions: list[str] = field(
         default_factory=lambda: list(DEFAULT_ALLOWED_EXTENSIONS)
     )
@@ -237,21 +265,22 @@ class QdrantIngestionConfig:
     default_chunk_size: int = 512
     default_chunk_overlap: int = 64
 
-    # --- Tracking (déduplication) ---
-    # Fichier SQLite local pour tracker les fichiers déjà ingérés
+    # --- Tracking (déduplication via SQLite) ---
     tracker_db_path: str = field(
         default_factory=lambda: os.getenv(
             "CIVITAS_TRACKER_DB", ".civitas_ingestion_tracker.db"
         )
     )
 
-    # --- Concurrence ---
-    max_workers: int = 4
-    batch_size: int = 50              # Nombre de points Qdrant par batch d'upsert
+    # --- Perf ---
+    max_workers: int = 4           # Réservé pour parallélisation future
+    batch_size: int = 50           # Points Qdrant par batch d'upsert
 
     # --- Logging ---
     log_level: str = "INFO"
     log_file: Optional[str] = None
+
+    # ── YAML Loading ──────────────────────────────────────────
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "QdrantIngestionConfig":
@@ -259,14 +288,14 @@ class QdrantIngestionConfig:
         import yaml
         with open(yaml_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
-        return cls._from_dict(data)
+        return cls._from_dict(data or {})
 
     @classmethod
     def _from_dict(cls, data: dict) -> "QdrantIngestionConfig":
         qdrant_cfg = data.get("qdrant", {})
-        emb_cfg = data.get("embedding", {})
-        coll_cfg = data.get("collections", {})
-        ing_cfg = data.get("ingestion", {})
+        emb_cfg    = data.get("embedding", {})
+        coll_cfg   = data.get("collections", {})
+        ing_cfg    = data.get("ingestion", {})
 
         embedding = EmbeddingConfig(
             provider=emb_cfg.get("provider", "sentence-transformers"),
@@ -275,12 +304,14 @@ class QdrantIngestionConfig:
             batch_size=emb_cfg.get("batch_size", 64),
             device=emb_cfg.get("device", "cpu"),
             normalize_embeddings=emb_cfg.get("normalize_embeddings", True),
+            # FIX: openai_api_key transmis depuis le YAML (était absent)
+            openai_api_key=emb_cfg.get("openai_api_key", os.getenv("OPENAI_API_KEY")),
             openai_model=emb_cfg.get("openai_model", "text-embedding-3-small"),
         )
 
         collections = {
             name: CollectionConfig.from_dict(name, cfg)
-            for name, cfg in coll_cfg.items()
+            for name, cfg in (coll_cfg or {}).items()
         }
 
         return cls(
@@ -288,6 +319,10 @@ class QdrantIngestionConfig:
             qdrant_port=int(qdrant_cfg.get("port", os.getenv("QDRANT_PORT", "6333"))),
             qdrant_api_key=qdrant_cfg.get("api_key", os.getenv("QDRANT_API_KEY")),
             qdrant_url=qdrant_cfg.get("url", os.getenv("QDRANT_URL")),
+            qdrant_in_memory=qdrant_cfg.get(
+                "in_memory",
+                os.getenv("QDRANT_IN_MEMORY", "false").lower() == "true",
+            ),
             embedding=embedding,
             collections=collections,
             allowed_extensions=ing_cfg.get(
@@ -305,14 +340,20 @@ class QdrantIngestionConfig:
             log_file=data.get("log_file"),
         )
 
+    # ── Helpers ───────────────────────────────────────────────
+
     def get_collection(self, name: str) -> CollectionConfig:
-        """Retourne la config d'une collection (crée une par défaut si inexistante)."""
+        """Retourne la config d'une collection (auto-créée par défaut si absente)."""
         if name not in self.collections:
             self.collections[name] = CollectionConfig(name=name)
         return self.collections[name]
 
-    def effective_extensions(self, scan: ScanConfig) -> list[str]:
-        """Retourne les extensions effectives pour un scan donné."""
+    def effective_extensions(self, scan: "ScanConfig") -> list[str]:
+        """
+        Résout les extensions effectives pour un scan donné.
+
+        Priorité: scan.allowed_extensions > collection.allowed_extensions > global.
+        """
         if scan.allowed_extensions:
             return scan.allowed_extensions
         col = self.collections.get(scan.collection_name)
