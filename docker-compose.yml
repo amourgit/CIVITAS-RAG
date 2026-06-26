@@ -1,0 +1,318 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  CIVITAS-RAG — Docker Compose                                       ║
+# ║  Stack complète : Qdrant · PostgreSQL/pgvector · App · Workers      ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+#
+# Usage rapide :
+#   make up              — démarrer toute la stack
+#   make down            — arrêter
+#   make logs            — voir les logs
+#   make ps              — état des services
+
+services:
+
+  # ══════════════════════════════════════════════════════════════════════
+  #  QDRANT — Base vectorielle
+  #  Doc : https://qdrant.tech/documentation/guides/installation/
+  # ══════════════════════════════════════════════════════════════════════
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    container_name: civitas_qdrant
+    restart: unless-stopped
+
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"       # REST API + Web UI
+      - "${QDRANT_GRPC_PORT:-6334}:6334"  # gRPC (optionnel)
+
+    volumes:
+      - qdrant_storage:/qdrant/storage:z
+      - ./config/qdrant:/qdrant/config:ro  # config override optionnel
+
+    environment:
+      # Sécurité : API key (optionnel en local, obligatoire en prod)
+      QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY:-}"
+      # Télémétrie désactivée
+      QDRANT__TELEMETRY_DISABLED: "true"
+      # Limites de performance
+      QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: "${QDRANT_SEARCH_THREADS:-0}"
+      # On-disk payload (économie RAM)
+      QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    networks:
+      - civitas_net
+
+    deploy:
+      resources:
+        limits:
+          memory: "${QDRANT_MEMORY_LIMIT:-2g}"
+        reservations:
+          memory: 256m
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ══════════════════════════════════════════════════════════════════════
+  #  POSTGRESQL + PGVECTOR
+  #  Image officielle pgvector (inclut l'extension)
+  #  Doc : https://github.com/pgvector/pgvector
+  # ══════════════════════════════════════════════════════════════════════
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: civitas_postgres
+    restart: unless-stopped
+
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data:z
+      - ./database/migrations:/docker-entrypoint-initdb.d:ro  # Init SQL au démarrage
+      - ./config/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+
+    environment:
+      POSTGRES_DB:       "${POSTGRES_DB:-civitas_knowledge}"
+      POSTGRES_USER:     "${POSTGRES_USER:-civitas}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-civitas_secret}"
+      # Tuning PostgreSQL via env (surcharge postgresql.conf)
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+
+    command: >
+      postgres
+        -c config_file=/etc/postgresql/postgresql.conf
+        -c shared_preload_libraries=pg_stat_statements
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-civitas} -d ${POSTGRES_DB:-civitas_knowledge}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+    networks:
+      - civitas_net
+
+    deploy:
+      resources:
+        limits:
+          memory: "${POSTGRES_MEMORY_LIMIT:-1g}"
+        reservations:
+          memory: 128m
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ══════════════════════════════════════════════════════════════════════
+  #  CIVITAS APP — Application principale
+  # ══════════════════════════════════════════════════════════════════════
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+      args:
+        PYTHON_VERSION: "3.11"
+        BUILD_DATE: "${BUILD_DATE:-}"
+        GIT_COMMIT: "${GIT_COMMIT:-}"
+
+    image: civitas-rag:${APP_VERSION:-latest}
+    container_name: civitas_app
+    restart: unless-stopped
+
+    ports:
+      - "${APP_PORT:-8000}:8000"
+
+    volumes:
+      - ./data:/app/data:z                          # Documents à ingérer
+      - ./config:/app/config:ro                     # Config YAML
+      - tracker_data:/app/.civitas_tracker:z        # Tracker SQLite persistant
+      - ./logs:/app/logs:z                          # Logs applicatifs
+
+    environment:
+      # App
+      APP_ENV:        "${APP_ENV:-development}"
+      LOG_LEVEL:      "${LOG_LEVEL:-INFO}"
+      # Qdrant
+      QDRANT_HOST:    "qdrant"
+      QDRANT_PORT:    "6333"
+      QDRANT_API_KEY: "${QDRANT_API_KEY:-}"
+      # Postgres
+      POSTGRES_HOST:     "postgres"
+      POSTGRES_PORT:     "5432"
+      POSTGRES_DB:       "${POSTGRES_DB:-civitas_knowledge}"
+      POSTGRES_USER:     "${POSTGRES_USER:-civitas}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-civitas_secret}"
+      # Tracker
+      CIVITAS_TRACKER_DB: "/app/.civitas_tracker/tracker.db"
+      # Embedding
+      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-sentence-transformers}"
+      OPENAI_API_KEY:     "${OPENAI_API_KEY:-}"
+
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - civitas_net
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          memory: "${APP_MEMORY_LIMIT:-4g}"
+        reservations:
+          memory: 512m
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # ══════════════════════════════════════════════════════════════════════
+  #  CIVITAS WORKER — Ingestion en arrière-plan
+  #  Profil "worker" — démarré uniquement avec : make up-worker
+  # ══════════════════════════════════════════════════════════════════════
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+
+    image: civitas-rag:${APP_VERSION:-latest}
+    container_name: civitas_worker
+    restart: unless-stopped
+
+    command: >
+      python scripts/qdrant_ingest.py
+        -c /app/config/qdrant_ingestion.yaml
+        ingest --all
+
+    volumes:
+      - ./data:/app/data:z
+      - ./config:/app/config:ro
+      - tracker_data:/app/.civitas_tracker:z
+      - ./logs:/app/logs:z
+
+    environment:
+      QDRANT_HOST:       "qdrant"
+      QDRANT_PORT:       "6333"
+      QDRANT_API_KEY:    "${QDRANT_API_KEY:-}"
+      CIVITAS_TRACKER_DB: "/app/.civitas_tracker/tracker.db"
+      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-sentence-transformers}"
+      OPENAI_API_KEY:     "${OPENAI_API_KEY:-}"
+      LOG_LEVEL:          "${LOG_LEVEL:-INFO}"
+
+    depends_on:
+      qdrant:
+        condition: service_healthy
+
+    profiles:
+      - worker
+
+    networks:
+      - civitas_net
+
+    deploy:
+      resources:
+        limits:
+          memory: "${WORKER_MEMORY_LIMIT:-2g}"
+        reservations:
+          memory: 256m
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # ══════════════════════════════════════════════════════════════════════
+  #  PGADMIN — Interface web PostgreSQL (profil "tools")
+  #  Accès : http://localhost:5050
+  # ══════════════════════════════════════════════════════════════════════
+  pgadmin:
+    image: dpage/pgadmin4:8.6
+    container_name: civitas_pgadmin
+    restart: unless-stopped
+
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin:z
+      - ./config/pgadmin/servers.json:/pgadmin4/servers.json:ro
+
+    environment:
+      PGADMIN_DEFAULT_EMAIL:    "${PGADMIN_EMAIL:-admin@civitas.local}"
+      PGADMIN_DEFAULT_PASSWORD: "${PGADMIN_PASSWORD:-civitas_admin}"
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    profiles:
+      - tools
+
+    networks:
+      - civitas_net
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  RÉSEAUX
+# ══════════════════════════════════════════════════════════════════════
+networks:
+  civitas_net:
+    name: civitas_network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "172.28.0.0/16"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  VOLUMES persistants
+# ══════════════════════════════════════════════════════════════════════
+volumes:
+  qdrant_storage:
+    name: civitas_qdrant_storage
+    driver: local
+
+  postgres_data:
+    name: civitas_postgres_data
+    driver: local
+
+  tracker_data:
+    name: civitas_tracker_data
+    driver: local
+
+  pgadmin_data:
+    name: civitas_pgadmin_data
+    driver: local

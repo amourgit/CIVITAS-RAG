@@ -1,0 +1,15 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "CIVITAS PostgreSQL",
+      "Group": "CIVITAS",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "civitas_knowledge",
+      "Username": "civitas",
+      "SSLMode": "prefer",
+      "PassFile": "",
+      "Comment": "Base CIVITAS-RAG locale"
+    }
+  }
+}

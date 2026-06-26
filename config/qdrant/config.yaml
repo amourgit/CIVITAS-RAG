@@ -1,0 +1,23 @@
+# Qdrant server configuration override
+# Ref: https://qdrant.tech/documentation/guides/configuration/
+
+storage:
+  # Stockage des vecteurs sur disque si RAM limitée
+  on_disk_payload: true
+
+  performance:
+    max_search_threads: 0   # 0 = auto (nb de CPUs)
+    max_optimization_threads: 1
+
+  # HNSW par défaut pour toutes les nouvelles collections
+  hnsw_index:
+    m: 16
+    ef_construct: 100
+    full_scan_threshold: 10000
+
+service:
+  grpc_port: 6334
+  # Désactiver la télémétrie en production
+  telemetry_disabled: true
+
+log_level: INFO
