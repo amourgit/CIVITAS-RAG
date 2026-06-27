@@ -31,11 +31,32 @@ YELLOW := \033[33m
 RED    := \033[31m
 RESET  := \033[0m
 
-# ── Python / CLI ──────────────────────────────────────────────────────
-PYTHON      := python
-CLI         := $(PYTHON) scripts/qdrant_ingest.py
-PYTEST      := $(PYTHON) -m pytest
-PIP         := $(PYTHON) -m pip
+# ── Python version et virtualenv ─────────────────────────────────────
+# Version Python cible (surchargeable : make env python_version=3.12)
+python_version ?= 3.11
+# Nom du virtualenv (surchargeable : make env venv=.venv-custom)
+venv          ?= .venv
+
+# Chemin vers Python dans le venv (auto-résolu selon OS)
+VENV_DIR      := $(venv)
+VENV_PYTHON   := $(VENV_DIR)/bin/python
+VENV_PIP      := $(VENV_DIR)/bin/pip
+VENV_ACTIVATE := source $(VENV_DIR)/bin/activate
+
+# Python système : on cherche python3.X précis, sinon python3, sinon python
+PYTHON_BIN    := $(shell command -v python$(python_version) 2>/dev/null                    || command -v python3 2>/dev/null                    || command -v python 2>/dev/null)
+
+# Si le venv existe, utiliser son Python automatiquement
+ifeq ($(wildcard $(VENV_PYTHON)),$(VENV_PYTHON))
+  PYTHON  := $(VENV_PYTHON)
+  PIP     := $(VENV_PIP)
+else
+  PYTHON  := $(PYTHON_BIN)
+  PIP     := $(PYTHON_BIN) -m pip
+endif
+
+CLI    := $(PYTHON) scripts/qdrant_ingest.py
+PYTEST := $(PYTHON) -m pytest
 
 # ── Docker ────────────────────────────────────────────────────────────
 DC          := docker compose
@@ -129,10 +150,11 @@ _EMB_FLAGS    = $(_EMB_PROVIDER) $(_EMB_MODEL) $(_EMB_DIM)
         purge purge-tracker purge-qdrant \
         delete-file export export-all \
         db-shell db-migrate db-reset db-dump \
-        install install-dev lint format type-check \
-        test test-unit test-watch \
+        env env-dev env-ci install install-dev install-ci python-info \
+        lint format type-check \
+        test test-unit test-cov test-watch \
         build build-no-cache push \
-        clean clean-docker clean-tracker nuke \
+        clean clean-venv clean-cache clean-docker clean-tracker nuke \
         env-check
 
 # ══════════════════════════════════════════════════════════════════════
@@ -630,60 +652,149 @@ db-dump:
 	@printf "$(GREEN)✓ Backup dans ./backups/$(RESET)\n"
 
 # ══════════════════════════════════════════════════════════════════════
-#  DÉVELOPPEMENT
+#  ENVIRONNEMENT PYTHON — Création, installation, nettoyage
 # ══════════════════════════════════════════════════════════════════════
 
-## install : Installer les dépendances de production
+## env : Créer le venv et installer les dépendances de production
+## Exemples :
+##   make env
+##   make env python_version=3.12
+##   make env venv=.venv-prod
+env:
+	@printf "$(BOLD)$(CYAN)▶ Création environnement Python $(python_version)...$(RESET)\n"
+	@PYBIN=$$(command -v python$(python_version) 2>/dev/null \
+	  || command -v python3 2>/dev/null \
+	  || command -v python 2>/dev/null) ; \
+	[ -n "$$PYBIN" ] || { \
+	  printf "$(RED)✗ python$(python_version) introuvable.\n" ; \
+	  printf "  Installez-le : sudo apt install python$(python_version) python$(python_version)-venv\n$(RESET)" ; \
+	  exit 1 ; \
+	} ; \
+	ACTUAL=$$($$PYBIN --version 2>&1) ; \
+	printf "  Python : $(GREEN)$$PYBIN$(RESET) ($$ACTUAL)\n" ; \
+	if [ ! -d "$(venv)" ]; then \
+	  $$PYBIN -m venv $(venv) ; \
+	  printf "$(GREEN)✓ Virtualenv créé : $(venv)$(RESET)\n" ; \
+	else \
+	  printf "$(YELLOW)⚠  Virtualenv existant : $(venv) (réutilisé)$(RESET)\n" ; \
+	fi
+	@printf "$(CYAN)▶ Mise à jour pip / setuptools / wheel...$(RESET)\n"
+	@$(venv)/bin/pip install --quiet --upgrade pip setuptools wheel
+	@printf "$(CYAN)▶ Installation requirements.txt...$(RESET)\n"
+	@$(venv)/bin/pip install -r requirements.txt
+	@printf "$(GREEN)✓ Environnement prêt$(RESET)\n"
+	@printf "  Activer  : $(CYAN)source $(venv)/bin/activate$(RESET)\n"
+	@printf "  Vérifier : $(CYAN)make python-info$(RESET)\n"
+
+## env-dev : Créer le venv et installer prod + outils de développement
+## Exemples :
+##   make env-dev
+##   make env-dev python_version=3.12 venv=.venv-dev
+env-dev:
+	@printf "$(BOLD)$(CYAN)▶ Création environnement dev Python $(python_version)...$(RESET)\n"
+	@PYBIN=$$(command -v python$(python_version) 2>/dev/null \
+	  || command -v python3 2>/dev/null \
+	  || command -v python 2>/dev/null) ; \
+	[ -n "$$PYBIN" ] || { \
+	  printf "$(RED)✗ python$(python_version) introuvable.$(RESET)\n" ; exit 1 ; \
+	} ; \
+	ACTUAL=$$($$PYBIN --version 2>&1) ; \
+	printf "  Python : $(GREEN)$$PYBIN$(RESET) ($$ACTUAL)\n" ; \
+	if [ ! -d "$(venv)" ]; then \
+	  $$PYBIN -m venv $(venv) ; \
+	  printf "$(GREEN)✓ Virtualenv créé : $(venv)$(RESET)\n" ; \
+	else \
+	  printf "$(YELLOW)⚠  Virtualenv existant : $(venv) (réutilisé)$(RESET)\n" ; \
+	fi
+	@$(venv)/bin/pip install --quiet --upgrade pip setuptools wheel
+	@printf "$(CYAN)▶ Installation requirements-dev.txt (prod + dev)...$(RESET)\n"
+	@$(venv)/bin/pip install -r requirements-dev.txt
+	@printf "$(GREEN)✓ Environnement dev prêt$(RESET)\n"
+	@printf "  Activer : $(CYAN)source $(venv)/bin/activate$(RESET)\n"
+	@printf "  Tests   : $(CYAN)make test$(RESET)\n"
+	@printf "  Lint    : $(CYAN)make lint$(RESET)\n"
+
+## env-ci : Créer le venv CI minimal (offline, sans sentence-transformers)
+## Exemples :
+##   make env-ci
+##   make env-ci python_version=3.11 venv=.venv-ci
+env-ci:
+	@printf "$(BOLD)$(CYAN)▶ Création environnement CI Python $(python_version)...$(RESET)\n"
+	@PYBIN=$$(command -v python$(python_version) 2>/dev/null \
+	  || command -v python3 2>/dev/null \
+	  || command -v python 2>/dev/null) ; \
+	[ -n "$$PYBIN" ] || { printf "$(RED)✗ python$(python_version) introuvable.$(RESET)\n" ; exit 1 ; } ; \
+	if [ ! -d "$(venv)" ]; then $$PYBIN -m venv $(venv) ; fi
+	@$(venv)/bin/pip install --quiet --upgrade pip setuptools wheel
+	@printf "$(CYAN)▶ Installation requirements-ci.txt (minimal, offline-friendly)...$(RESET)\n"
+	@$(venv)/bin/pip install -r requirements-ci.txt
+	@printf "$(GREEN)✓ Environnement CI prêt$(RESET)\n"
+	@printf "  Mode embedding offline : $(CYAN)--embedding-provider tfidf-local$(RESET)\n"
+
+## install : Installer requirements.txt dans l'environnement Python actif
+## (Pour installer dans un venv déjà activé. Sinon : make env)
 install:
-	$(PIP) install --upgrade pip
-	$(PIP) install \
-		qdrant-client \
-		sentence-transformers \
-		scikit-learn \
-		rich \
-		pyyaml \
-		python-dotenv \
-		chardet \
-		pypdf \
-		python-docx
+	@printf "$(CYAN)▶ Installation requirements.txt...$(RESET)\n"
+	$(PIP) install --upgrade pip setuptools wheel
+	$(PIP) install -r requirements.txt
+	@printf "$(GREEN)✓ Dépendances production installées$(RESET)\n"
 
-## install-dev : Installer toutes les dépendances (prod + dev)
+## install-dev : Installer requirements-dev.txt dans l'environnement actif
 install-dev:
-	$(PIP) install --upgrade pip
-	$(PIP) install -e ".[dev]" 2>/dev/null || \
-	$(PIP) install \
-		qdrant-client \
-		sentence-transformers \
-		scikit-learn \
-		rich \
-		pyyaml \
-		python-dotenv \
-		chardet \
-		pypdf \
-		python-docx \
-		pytest \
-		pytest-asyncio \
-		ruff \
-		mypy
-	@printf "$(GREEN)✓ Dépendances installées$(RESET)\n"
+	@printf "$(CYAN)▶ Installation requirements-dev.txt...$(RESET)\n"
+	$(PIP) install --upgrade pip setuptools wheel
+	$(PIP) install -r requirements-dev.txt
+	@printf "$(GREEN)✓ Dépendances dev installées$(RESET)\n"
 
-## lint : Analyser le code (ruff)
+## install-ci : Installer requirements-ci.txt dans l'environnement actif
+install-ci:
+	$(PIP) install --upgrade pip setuptools wheel
+	$(PIP) install -r requirements-ci.txt
+	@printf "$(GREEN)✓ Dépendances CI installées$(RESET)\n"
+
+## python-info : Informations sur l'environnement Python actif
+python-info:
+	@printf "\n$(BOLD)Environnement Python actif :$(RESET)\n"
+	@printf "  $(CYAN)Exécutable$(RESET) : $$($(PYTHON) -c 'import sys; print(sys.executable)')\n"
+	@printf "  $(CYAN)Version$(RESET)    : $$($(PYTHON) --version 2>&1)\n"
+	@printf "  $(CYAN)Venv dir$(RESET)   : $(venv) ($$([ -d $(venv) ] && echo '$(GREEN)existe$(RESET)' || echo '$(RED)absent$(RESET)'))\n"
+	@printf "  $(CYAN)Packages$(RESET)   : $$($(PIP) list 2>/dev/null | wc -l) installés\n"
+	@printf "\n$(BOLD)Packages clés :$(RESET)\n"
+	@$(PYTHON) -c "\
+pkgs = {\
+  'qdrant_client':         'qdrant-client',\
+  'sentence_transformers': 'sentence-transformers',\
+  'sklearn':               'scikit-learn',\
+  'rich':                  'rich',\
+  'yaml':                  'pyyaml',\
+  'dotenv':                'python-dotenv',\
+  'pytest':                'pytest',\
+};\
+import importlib.util;\
+[print(f'  {(\"$(GREEN)✓$(RESET)\" if importlib.util.find_spec(k) else \"$(RED)✗$(RESET)\"):<20} {v}') for k,v in pkgs.items()]" 2>/dev/null || true
+	@printf "\n"
+
+# ══════════════════════════════════════════════════════════════════════
+#  DÉVELOPPEMENT — Qualité de code et tests
+# ══════════════════════════════════════════════════════════════════════
+
+## lint : Analyser le code avec ruff
 lint:
-	@printf "$(CYAN)▶ Lint...$(RESET)\n"
-	ruff check civitas/ scripts/ tests/ || true
+	@printf "$(CYAN)▶ Lint (ruff)...$(RESET)\n"
+	$(PYTHON) -m ruff check civitas/ scripts/ tests/ || true
 	@printf "$(GREEN)✓ Lint terminé$(RESET)\n"
 
-## format : Formater le code (ruff)
+## format : Formater le code avec ruff
 format:
-	@printf "$(CYAN)▶ Format...$(RESET)\n"
-	ruff format civitas/ scripts/ tests/
-	ruff check --fix civitas/ scripts/ tests/ || true
+	@printf "$(CYAN)▶ Format (ruff)...$(RESET)\n"
+	$(PYTHON) -m ruff format civitas/ scripts/ tests/
+	$(PYTHON) -m ruff check --fix civitas/ scripts/ tests/ || true
 	@printf "$(GREEN)✓ Format terminé$(RESET)\n"
 
-## type-check : Vérification des types (mypy)
+## type-check : Vérification statique des types (mypy)
 type-check:
-	@printf "$(CYAN)▶ Type check...$(RESET)\n"
-	mypy civitas/ || true
+	@printf "$(CYAN)▶ Type check (mypy)...$(RESET)\n"
+	$(PYTHON) -m mypy civitas/ || true
 	@printf "$(GREEN)✓ Type check terminé$(RESET)\n"
 
 ## test : Lancer tous les tests
@@ -702,9 +813,18 @@ test-unit:
 		-p no:cacheprovider \
 		--override-ini="addopts="
 
-## test-watch : Relancer les tests à chaque modification (nécessite pytest-watch)
+## test-cov : Tests avec rapport de couverture HTML
+test-cov:
+	$(PYTEST) $(test_path) \
+		-v --tb=short \
+		--cov=$(test_cov) --cov-report=term-missing --cov-report=html \
+		-p no:cacheprovider \
+		--override-ini="addopts="
+	@printf "$(GREEN)✓ Rapport : htmlcov/index.html$(RESET)\n"
+
+## test-watch : Relancer les tests automatiquement à chaque modification
 test-watch:
-	ptw tests/ -- -v --tb=short --override-ini="addopts="
+	$(PYTHON) -m pytest_watch tests/ -- -v --tb=short --override-ini="addopts="
 
 # ══════════════════════════════════════════════════════════════════════
 #  BUILD / IMAGE DOCKER
@@ -737,18 +857,46 @@ push: build
 #  NETTOYAGE
 # ══════════════════════════════════════════════════════════════════════
 
-## clean : Nettoyer les fichiers temporaires Python
+## clean : Nettoyer les caches Python (pyc, __pycache__, .pytest_cache...)
+## Ne touche pas au venv ni aux données Qdrant/tracker
 clean:
-	@printf "$(CYAN)▶ Nettoyage fichiers temporaires...$(RESET)\n"
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	find . -type f -name "*.pyc" -delete 2>/dev/null || true
-	find . -type f -name "*.pyo" -delete 2>/dev/null || true
-	find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
-	find . -type d -name ".pytest_cache" -exec rm -rf {} + 2>/dev/null || true
-	find . -type d -name ".ruff_cache" -exec rm -rf {} + 2>/dev/null || true
-	find . -type d -name ".mypy_cache" -exec rm -rf {} + 2>/dev/null || true
-	rm -f .coverage coverage.xml
+	@printf "$(CYAN)▶ Nettoyage caches Python...$(RESET)\n"
+	@$(MAKE) --no-print-directory clean-cache
 	@printf "$(GREEN)✓ Nettoyage terminé$(RESET)\n"
+
+## clean-cache : Supprimer tous les caches sans toucher au venv
+clean-cache:
+	@printf "$(CYAN)▶ Suppression des caches...$(RESET)\n"
+	find . -type d -name __pycache__ -not -path "./.venv/*" -not -path "./$(venv)/*" \
+	  -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name "*.pyc" -not -path "./.venv/*" -delete 2>/dev/null || true
+	find . -type f -name "*.pyo" -not -path "./.venv/*" -delete 2>/dev/null || true
+	find . -type d -name "*.egg-info" -not -path "./.venv/*" \
+	  -exec rm -rf {} + 2>/dev/null || true
+	rm -rf .pytest_cache .ruff_cache .mypy_cache htmlcov 2>/dev/null || true
+	rm -f .coverage coverage.xml 2>/dev/null || true
+	@printf "$(GREEN)✓ Caches supprimés$(RESET)\n"
+
+## clean-venv : Supprimer le virtualenv (repart de zéro avec make env)
+## Exemple : make clean-venv
+## Exemple : make clean-venv venv=.venv-dev
+clean-venv:
+	@if [ ! -d "$(venv)" ]; then 	  printf "$(YELLOW)⚠  Venv '$(venv)' absent — rien à supprimer$(RESET)\n" ; 	  exit 0 ; 	fi
+	@printf "$(YELLOW)⚠  Suppression du virtualenv '$(venv)'. Continuer ? [y/N] $(RESET)" && \
+	read ans && [ "$${ans:-N}" = "y" ] || (printf "Annulé.\n" && exit 0)
+	rm -rf $(venv)
+	@printf "$(GREEN)✓ Virtualenv '$(venv)' supprimé$(RESET)\n"
+	@printf "  Recréer : $(CYAN)make env$(RESET)\n"
+
+## clean-full : Supprimer venv + caches (repartir de zéro proprement)
+## Équivalent : make clean-venv + make clean-cache
+## Ne touche PAS aux données Qdrant ni au tracker SQLite
+clean-full:
+	@printf "$(BOLD)$(YELLOW)▶ Nettoyage complet (venv + caches)...$(RESET)\n"
+	@if [ -d "$(venv)" ]; then 	  printf "$(YELLOW)⚠  Suppression du venv '$(venv)' + tous les caches. Continuer ? [y/N] $(RESET)" && \
+	  read ans && [ "$${ans:-N}" = "y" ] || (printf "Annulé.\n" && exit 0) ; 	  rm -rf $(venv) ; 	  printf "$(GREEN)✓ Venv supprimé$(RESET)\n" ; 	fi
+	$(MAKE) --no-print-directory clean-cache
+	@printf "$(GREEN)✓ Environnement nettoyé — relancer avec : make env-dev$(RESET)\n"
 
 ## clean-docker : Supprimer les volumes Docker (PERD LES DONNÉES Qdrant + Postgres)
 clean-docker:

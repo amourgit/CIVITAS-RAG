@@ -1,0 +1,30 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  CIVITAS-RAG — Dépendances CI/CD (offline-friendly)                ║
+# ║  Sous-ensemble minimal pour tests + ingestion en CI sans GPU        ║
+# ║                                                                     ║
+# ║  Pas de sentence-transformers (évite le dl HuggingFace en CI)      ║
+# ║  Utilise tfidf-local à la place.                                    ║
+# ║                                                                     ║
+# ║  Installation : make env-ci                                         ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# Vectorielle
+qdrant-client>=1.9.0
+
+# Embedding offline
+scikit-learn>=1.4.0
+numpy>=1.26.0
+
+# Parsing
+pypdf>=4.2.0
+python-docx>=1.1.0
+chardet>=5.2.0
+
+# Config
+python-dotenv>=1.0.1
+pyyaml>=6.0.1
+rich>=13.7.1
+
+# Tests
+pytest>=8.1.0
+pytest-asyncio>=0.23.0

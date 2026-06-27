@@ -1,0 +1,25 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  CIVITAS-RAG — Dépendances de développement                        ║
+# ║  Inclut toutes les dépendances de production + outils dev           ║
+# ║                                                                     ║
+# ║  Installation :                                                     ║
+# ║    make env-dev        → créer venv + installer prod + dev          ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ── Production (inclure tout) ─────────────────────────────────────────
+-r requirements.txt
+
+# ── Tests ─────────────────────────────────────────────────────────────
+pytest>=8.1.0
+pytest-asyncio>=0.23.0
+pytest-cov>=5.0.0
+pytest-watch>=4.2.0          # make test-watch
+
+# ── Qualité de code ───────────────────────────────────────────────────
+ruff>=0.4.0                  # Linter + formatter
+mypy>=1.9.0                  # Type checking
+pre-commit>=3.7.0            # Git hooks
+
+# ── Dev experience ────────────────────────────────────────────────────
+ipython>=8.23.0              # REPL enrichi
+ipykernel>=6.29.0            # Jupyter kernel
