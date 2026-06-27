@@ -221,14 +221,22 @@ class CivitasQdrantClient:
             logger.info("Connected to Qdrant Cloud: %s", self.url)
 
         else:
-            # Local / Docker — HTTP plain, prefer_grpc=False pour éviter tout TLS
-            api_key = self.api_key if self.api_key else None
+            # Local / Docker — HTTP plain forcé.
+            #
+            # IMPORTANT — qdrant-client >= 1.9 (QdrantRemote.__init__) :
+            #   self._https = https if https is not None else api_key is not None
+            #
+            # Si api_key est une string non-nulle (même vide ""), https devient True
+            # automatiquement → SSL WRONG_VERSION_NUMBER sur un serveur HTTP.
+            # On doit passer https=False explicitement ET filtrer api_key vide.
+            api_key_clean = self.api_key if self.api_key else None
             self._client = QdrantClient(
                 host=self.host,
                 port=self.port,
-                api_key=api_key,
+                api_key=api_key_clean,
                 timeout=self.timeout,
                 prefer_grpc=False,
+                https=False,           # ← CRITIQUE : désactiver TLS explicitement
             )
             logger.info("Connected to Qdrant: http://%s:%d", self.host, self.port)
 

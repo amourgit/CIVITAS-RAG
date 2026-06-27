@@ -238,8 +238,10 @@ class QdrantIngestionConfig:
     qdrant_port: int = field(
         default_factory=lambda: int(os.getenv("QDRANT_PORT", "6333"))
     )
+    # IMPORTANT: filtrer la string vide — QDRANT_API_KEY= vide doit être None,
+    # sinon qdrant-client active HTTPS automatiquement (api_key is not None → https=True)
     qdrant_api_key: Optional[str] = field(
-        default_factory=lambda: os.getenv("QDRANT_API_KEY")
+        default_factory=lambda: os.getenv("QDRANT_API_KEY") or None
     )
     # URL complète (Qdrant Cloud) — prend la priorité sur host+port
     # IMPORTANT: os.getenv retourne '' si la var est définie mais vide → on filtre
