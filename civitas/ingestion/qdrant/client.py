@@ -222,28 +222,41 @@ class CivitasQdrantClient:
             logger.info("Connected to Qdrant Cloud: %s", self.url)
 
         else:
-            # Local / Docker — HTTP plain forcé.
+            # Local / Docker — HTTP plain.
             #
-            # Deux règles strictes pour éviter les warnings et le bug SSL :
+            # Règles critiques (qdrant-client >= 1.9, QdrantRemote.__init__) :
             #
-            # 1. https=False TOUJOURS en local — sinon qdrant-client active TLS
-            #    automatiquement si api_key is not None (comportement 1.9+).
+            # 1. https=False OBLIGATOIRE — sans ça, qdrant-client active TLS
+            #    automatiquement dès que api_key is not None
+            #    → SSL WRONG_VERSION_NUMBER sur un serveur HTTP.
             #
-            # 2. api_key=None TOUJOURS en local — une api_key locale ne sert à rien
-            #    (Qdrant sans TLS ignore l'auth) et déclenche le warning
-            #    "Api key is used with an insecure connection".
+            # 2. api_key transmis si défini — Qdrant peut exiger une API key
+            #    même en local (QDRANT__SERVICE__API_KEY dans docker-compose).
+            #    Sans la clé → HTTP 401 Unauthorized.
             #
-            # 3. check_compatibility=False — évite le warning de version
-            #    entre qdrant-client et le serveur Qdrant Docker.
-            self._client = QdrantClient(
-                host=self.host,
-                port=self.port,
-                api_key=None,              # Pas d'auth en local (HTTP sans TLS)
-                timeout=self.timeout,
-                prefer_grpc=False,
-                https=False,               # TLS désactivé explicitement
-                check_compatibility=False, # Ignorer diff de version client/serveur
-            )
+            # 3. Le warning "Api key with insecure connection" est attendu et
+            #    volontairement supprimé : on sait qu'on est en HTTP local,
+            #    c'est le comportement voulu.
+            #
+            # 4. check_compatibility=False — supprime le warning de version
+            #    entre qdrant-client Python et le serveur Qdrant Docker.
+            import warnings as _w
+            api_key_local = self.api_key if self.api_key else None
+            with _w.catch_warnings():
+                _w.filterwarnings(
+                    "ignore",
+                    message=".*insecure connection.*",
+                    category=UserWarning,
+                )
+                self._client = QdrantClient(
+                    host=self.host,
+                    port=self.port,
+                    api_key=api_key_local,     # Transmis si défini (auth Qdrant)
+                    timeout=self.timeout,
+                    prefer_grpc=False,
+                    https=False,               # TLS désactivé — OBLIGATOIRE
+                    check_compatibility=False, # Ignorer diff version client/serveur
+                )
             logger.info("Connected to Qdrant: http://%s:%d", self.host, self.port)
 
         return self._client

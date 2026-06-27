@@ -29,7 +29,9 @@ services:
       - ./config/qdrant:/qdrant/config:ro  # config override optionnel
 
     environment:
-      # Sécurité : API key (optionnel en local, obligatoire en prod)
+      # API key Qdrant — laisser VIDE en local pour désactiver l'auth.
+      # Si QDRANT_API_KEY est défini dans .env, Qdrant exige la clé sur chaque requête.
+      # Le client Python doit alors avoir la même valeur dans QDRANT_API_KEY.
       QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY:-}"
       # Télémétrie désactivée
       QDRANT__TELEMETRY_DISABLED: "true"
