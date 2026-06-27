@@ -217,26 +217,32 @@ class CivitasQdrantClient:
                 url=self.url,
                 api_key=self.api_key,
                 timeout=self.timeout,
+                check_compatibility=False,  # Ignorer diff version client/serveur
             )
             logger.info("Connected to Qdrant Cloud: %s", self.url)
 
         else:
             # Local / Docker — HTTP plain forcé.
             #
-            # IMPORTANT — qdrant-client >= 1.9 (QdrantRemote.__init__) :
-            #   self._https = https if https is not None else api_key is not None
+            # Deux règles strictes pour éviter les warnings et le bug SSL :
             #
-            # Si api_key est une string non-nulle (même vide ""), https devient True
-            # automatiquement → SSL WRONG_VERSION_NUMBER sur un serveur HTTP.
-            # On doit passer https=False explicitement ET filtrer api_key vide.
-            api_key_clean = self.api_key if self.api_key else None
+            # 1. https=False TOUJOURS en local — sinon qdrant-client active TLS
+            #    automatiquement si api_key is not None (comportement 1.9+).
+            #
+            # 2. api_key=None TOUJOURS en local — une api_key locale ne sert à rien
+            #    (Qdrant sans TLS ignore l'auth) et déclenche le warning
+            #    "Api key is used with an insecure connection".
+            #
+            # 3. check_compatibility=False — évite le warning de version
+            #    entre qdrant-client et le serveur Qdrant Docker.
             self._client = QdrantClient(
                 host=self.host,
                 port=self.port,
-                api_key=api_key_clean,
+                api_key=None,              # Pas d'auth en local (HTTP sans TLS)
                 timeout=self.timeout,
                 prefer_grpc=False,
-                https=False,           # ← CRITIQUE : désactiver TLS explicitement
+                https=False,               # TLS désactivé explicitement
+                check_compatibility=False, # Ignorer diff de version client/serveur
             )
             logger.info("Connected to Qdrant: http://%s:%d", self.host, self.port)
 
