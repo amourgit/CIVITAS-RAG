@@ -160,8 +160,46 @@ class CivitasQdrantClient:
             in_memory=getattr(config, "qdrant_in_memory", False),
         )
 
+    @staticmethod
+    def _url_is_cloud(url: str) -> bool:
+        """
+        Retourne True uniquement si l'URL est une URL Qdrant Cloud distante (TLS requis).
+
+        Une URL est CLOUD (TLS) si elle commence par https:// ET ne cible pas
+        localhost / 127.x / ::1.
+
+        Cas déclenchant SSL WRONG_VERSION_NUMBER à éviter absolument :
+          - QDRANT_URL=https://localhost:6333   → LOCAL, pas de TLS
+          - QDRANT_URL=http://localhost:6333    → LOCAL, pas de TLS
+          - url="" ou url=None                 → LOCAL host:port
+          - url=https://xxxx.cloud.qdrant.io   → CLOUD, TLS
+        """
+        if not url:
+            return False
+        u = url.lower()
+        if not u.startswith("https://"):
+            return False
+        # https:// mais vers un hôte local → pas de TLS
+        local_patterns = ("localhost", "127.", "::1", "0.0.0.0")
+        return not any(p in u for p in local_patterns)
+
     def _get_client(self):
-        """Lazy-init du client Qdrant."""
+        """
+        Lazy-init du client Qdrant.
+
+        Priorité de connexion :
+          1. in_memory=True              → mode test, aucun serveur requis
+          2. url pointe vers Qdrant Cloud → connexion TLS (https://xxx.cloud.qdrant.io)
+          3. Tous les autres cas          → connexion HTTP plain via host:port
+
+        Le cas 3 couvre :
+          - QDRANT_URL non défini (cas standard local/Docker)
+          - QDRANT_URL=http://localhost:6333 (URL locale explicite)
+          - QDRANT_URL=https://localhost:6333 (mauvaise config → on ignore le TLS)
+
+        Cela évite l'erreur [SSL: WRONG_VERSION_NUMBER] quand QDRANT_URL est
+        défini avec une URL locale et que Qdrant tourne sans TLS.
+        """
         if self._client is not None:
             return self._client
         try:
@@ -172,21 +210,27 @@ class CivitasQdrantClient:
         if self.in_memory:
             self._client = QdrantClient(":memory:")
             logger.info("Using Qdrant in-memory mode (dev/test)")
-        elif self.url:
+
+        elif self._url_is_cloud(self.url):
+            # Qdrant Cloud — connexion TLS obligatoire
             self._client = QdrantClient(
                 url=self.url,
                 api_key=self.api_key,
                 timeout=self.timeout,
             )
             logger.info("Connected to Qdrant Cloud: %s", self.url)
+
         else:
+            # Local / Docker — HTTP plain, prefer_grpc=False pour éviter tout TLS
+            api_key = self.api_key if self.api_key else None
             self._client = QdrantClient(
                 host=self.host,
                 port=self.port,
-                api_key=self.api_key,
+                api_key=api_key,
                 timeout=self.timeout,
+                prefer_grpc=False,
             )
-            logger.info("Connected to Qdrant: %s:%d", self.host, self.port)
+            logger.info("Connected to Qdrant: http://%s:%d", self.host, self.port)
 
         return self._client
 

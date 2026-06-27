@@ -242,8 +242,9 @@ class QdrantIngestionConfig:
         default_factory=lambda: os.getenv("QDRANT_API_KEY")
     )
     # URL complète (Qdrant Cloud) — prend la priorité sur host+port
+    # IMPORTANT: os.getenv retourne '' si la var est définie mais vide → on filtre
     qdrant_url: Optional[str] = field(
-        default_factory=lambda: os.getenv("QDRANT_URL")
+        default_factory=lambda: os.getenv("QDRANT_URL") or None
     )
     # Mode in-memory (tests, dev sans serveur Qdrant)
     qdrant_in_memory: bool = field(
@@ -318,7 +319,7 @@ class QdrantIngestionConfig:
             qdrant_host=qdrant_cfg.get("host", os.getenv("QDRANT_HOST", "localhost")),
             qdrant_port=int(qdrant_cfg.get("port", os.getenv("QDRANT_PORT", "6333"))),
             qdrant_api_key=qdrant_cfg.get("api_key", os.getenv("QDRANT_API_KEY")),
-            qdrant_url=qdrant_cfg.get("url", os.getenv("QDRANT_URL")),
+            qdrant_url=qdrant_cfg.get("url") or os.getenv("QDRANT_URL") or None,
             qdrant_in_memory=qdrant_cfg.get(
                 "in_memory",
                 os.getenv("QDRANT_IN_MEMORY", "false").lower() == "true",
