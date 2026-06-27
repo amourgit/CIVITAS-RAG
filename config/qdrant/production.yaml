@@ -1,0 +1,33 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  Qdrant — Configuration production                                   ║
+# ║  Fichier lu par Qdrant Docker (RUN_MODE=production, défaut)          ║
+# ║  Ref : https://qdrant.tech/documentation/ops-configuration/          ║
+# ║                                                                       ║
+# ║  IMPORTANT : Ce fichier s'appelle production.yaml (pas config.yaml)  ║
+# ║  Qdrant Docker lit /qdrant/config/production.yaml par défaut.        ║
+# ║  Les variables d'environnement QDRANT__* ont priorité sur ce fichier.║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+storage:
+  # Stocker les payloads sur disque → économie RAM
+  on_disk_payload: true
+
+  performance:
+    max_search_threads: 0        # 0 = auto (nb de CPUs disponibles)
+    max_optimization_threads: 1  # Limiter l'impact CPU des optimisations
+
+  hnsw_index:
+    m: 16                        # Nb de liens par nœud (qualité/mémoire)
+    ef_construct: 100            # Précision de construction du graphe
+
+service:
+  # AUTH : ne pas définir api_key ici — géré par QDRANT__SERVICE__API_KEY
+  # Si QDRANT_API_KEY est vide dans .env → pas d'auth
+  # Si QDRANT_API_KEY=xyz dans .env → auth activée, la même clé requise côté client
+  # api_key: ""   ← NE PAS DÉCOMMENTER : une string vide active quand même l'auth !
+
+  grpc_port: 6334
+
+telemetry_disabled: true
+
+log_level: INFO

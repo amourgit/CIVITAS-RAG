@@ -29,32 +29,29 @@ services:
       - ./config/qdrant:/qdrant/config:ro  # config override optionnel
 
     environment:
-      # API key Qdrant.
-      #
-      # COMPORTEMENT :
-      #   · QDRANT_API_KEY vide (défaut) → variable non transmise → Qdrant sans auth
-      #   · QDRANT_API_KEY=xyz           → Qdrant active l'auth, exige cette clé
-      #
-      # IMPORTANT : si vous changez cette valeur après le premier démarrage,
-      # vous devez supprimer le volume Qdrant et relancer :
-      #   make down && docker volume rm civitas_qdrant_storage && make up
-      #
-      # La syntaxe ${VAR:+valeur} transmet la variable SEULEMENT si non-vide.
-      # Quand vide → Qdrant démarre sans auth (pas de 401 Unauthorized).
-      QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY}"
-      # Télémétrie désactivée
+      # Télémétrie désactivée (la config production.yaml la désactive aussi,
+      # mais la variable d'env a priorité — double sécurité)
       QDRANT__TELEMETRY_DISABLED: "true"
       # Limites de performance
       QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: "${QDRANT_SEARCH_THREADS:-0}"
       # On-disk payload (économie RAM)
       QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
+      #
+      # AUTH : QDRANT__SERVICE__API_KEY est intentionnellement ABSENT ici.
+      # Raison : si défini même vide (""), Qdrant l'interprète comme une clé
+      # et active l'authentification → HTTP 401 sur toutes les requêtes.
+      #
+      # Pour activer l'auth en production :
+      #   Ajouter api_key dans config/qdrant/production.yaml (pas ici).
 
     healthcheck:
-      test: ["CMD-SHELL", "timeout 5s bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      # /readyz est l'endpoint officiel Qdrant pour le healthcheck
+      # curl est disponible dans l'image qdrant/qdrant
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/readyz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 15s
 
     networks:
       - civitas_net
