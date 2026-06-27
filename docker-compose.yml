@@ -29,10 +29,19 @@ services:
       - ./config/qdrant:/qdrant/config:ro  # config override optionnel
 
     environment:
-      # API key Qdrant — laisser VIDE en local pour désactiver l'auth.
-      # Si QDRANT_API_KEY est défini dans .env, Qdrant exige la clé sur chaque requête.
-      # Le client Python doit alors avoir la même valeur dans QDRANT_API_KEY.
-      QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY:-}"
+      # API key Qdrant.
+      #
+      # COMPORTEMENT :
+      #   · QDRANT_API_KEY vide (défaut) → variable non transmise → Qdrant sans auth
+      #   · QDRANT_API_KEY=xyz           → Qdrant active l'auth, exige cette clé
+      #
+      # IMPORTANT : si vous changez cette valeur après le premier démarrage,
+      # vous devez supprimer le volume Qdrant et relancer :
+      #   make down && docker volume rm civitas_qdrant_storage && make up
+      #
+      # La syntaxe ${VAR:+valeur} transmet la variable SEULEMENT si non-vide.
+      # Quand vide → Qdrant démarre sans auth (pas de 401 Unauthorized).
+      QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY}"
       # Télémétrie désactivée
       QDRANT__TELEMETRY_DISABLED: "true"
       # Limites de performance

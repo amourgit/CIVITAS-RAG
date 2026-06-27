@@ -154,7 +154,7 @@ _EMB_FLAGS    = $(_EMB_PROVIDER) $(_EMB_MODEL) $(_EMB_DIM)
         lint format type-check \
         test test-unit test-cov test-watch \
         build build-no-cache push \
-        clean clean-venv clean-cache clean-docker clean-tracker nuke \
+        clean clean-venv clean-cache clean-docker reset-qdrant clean-tracker nuke \
         env-check
 
 # ══════════════════════════════════════════════════════════════════════
@@ -906,6 +906,22 @@ clean-docker:
 	docker volume rm civitas_qdrant_storage civitas_postgres_data \
 		civitas_tracker_data civitas_pgadmin_data 2>/dev/null || true
 	@printf "$(GREEN)✓ Volumes supprimés$(RESET)\n"
+
+## reset-qdrant : Supprimer le volume Qdrant et relancer proprement
+## Utiliser quand : make ping → HTTP 401 (API key en mémoire ne correspond plus au .env)
+## Pré-requis : QDRANT_API_KEY= vide dans .env
+reset-qdrant:
+	@printf "$(BOLD)$(YELLOW)▶ Reset volume Qdrant (supprime toutes les collections)$(RESET)\n"
+	@printf "$(YELLOW)  Continuer ? [yes/N] $(RESET)" && \
+	read ans && [ "$$ans" = "yes" ] || (printf "Annulé.\n" && exit 0)
+	$(DC) -f $(DC_FILE) stop qdrant 2>/dev/null || true
+	$(DC) -f $(DC_FILE) rm -f qdrant 2>/dev/null || true
+	docker volume rm civitas_qdrant_storage 2>/dev/null || true
+	@printf "$(CYAN)▶ Redémarrage Qdrant (QDRANT_API_KEY=$${QDRANT_API_KEY:-vide})...$(RESET)\n"
+	$(DC) -f $(DC_FILE) up -d qdrant
+	@sleep 3
+	@printf "$(GREEN)✓ Qdrant relancé sans auth$(RESET)\n"
+	@printf "  Vérifier : $(CYAN)make ping$(RESET)\n"
 
 ## clean-tracker : Supprimer le tracker SQLite local
 clean-tracker:
